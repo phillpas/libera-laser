@@ -193,9 +193,12 @@ LaserCubeNetManager::prepareNewController(LaserCubeNetController& controller,
                                           const LaserCubeNetControllerInfo& info) {
     controller.updateDiscoveredStatus(info.status());
 
-    // Connect and start the controller thread on first acquisition.
-    if (auto result = controller.connect(info); !result) {
+    // A failed dark handshake is never cached. A later retry constructs a
+    // fresh locally disarmed controller instance.
+    const auto operation = LaserCubeNetOperation::withTimeout(std::chrono::milliseconds(750));
+    if (auto result = controller.connectDark(info, operation); !result) {
         logError("[LaserCubeNetManager] initial connect failed", result.error().message());
+        return NewControllerDisposition::DropController;
     }
     controller.startThread();
     return NewControllerDisposition::KeepController;
@@ -227,7 +230,10 @@ void LaserCubeNetManager::afterCloseControllers() {
 void LaserCubeNetManager::closeController(const std::string& key,
                                           LaserCubeNetController& controller) {
     (void)key;
-    controller.close();
+    const auto operation = LaserCubeNetOperation::withTimeout(std::chrono::milliseconds(750));
+    if (auto result = controller.shutdownDark(operation); !result) {
+        logError("[LaserCubeNetManager] shutdown-dark failed", result.error().message());
+    }
 }
 
 } // namespace libera::lasercubenet
