@@ -348,6 +348,9 @@ protected:
     PointRequestMetrics pointRequestMetrics{};
     // Stores 1/10,000th of a second units so we match legacy colour-shift semantics.
     std::atomic<double> scannerSyncTime{2.0}; // in 1/10,000 of a second
+    // Serializes the worker's colour-delay/last-position pipeline with
+    // lifecycle-thread startup/shutdown resets performed by setArmed().
+    mutable std::mutex pointPostProcessMutex;
     std::deque<LaserPoint> scannerSyncColourDelayLine;
     std::atomic<int> startupBlankPointsRemaining{0};
     std::atomic<int> shutdownBlankPointsRemaining{0};

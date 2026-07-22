@@ -142,6 +142,7 @@ bool LaserControllerStreaming::requestPoints(const PointFillRequest &request) {
 }
 
 void LaserControllerStreaming::postProcessOutputPoints(std::vector<LaserPoint>& points) {
+    std::lock_guard<std::mutex> postProcessLock(pointPostProcessMutex);
     // Apply startup blanking (first N points forced to black).
     // X/Y pass through so galvos can travel to content position while dark.
     // The delay line was cleared in resetStartupBlank() so it fills with
@@ -694,12 +695,14 @@ ControllerEventSeverity LaserControllerStreaming::recentEventSeverityNow(
 }
 
 void LaserControllerStreaming::resetStartupBlank() {
+    std::lock_guard<std::mutex> postProcessLock(pointPostProcessMutex);
     const int blankPoints = millisToPoints(1.0f);
     startupBlankPointsRemaining.store(blankPoints, std::memory_order_relaxed);
     scannerSyncColourDelayLine.clear();
 }
 
 void LaserControllerStreaming::resetShutdownBlank() {
+    std::lock_guard<std::mutex> postProcessLock(pointPostProcessMutex);
     // Hold at last content position (dark) long enough to flush the scanner
     // sync colour delay line plus 1 ms dwell, so no stale colours leak through
     // as galvos travel back to centre.
