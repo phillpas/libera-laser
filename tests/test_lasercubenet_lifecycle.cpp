@@ -64,6 +64,11 @@ struct PendingStatus {
     std::array<std::uint8_t, 64> packet{};
 };
 
+struct PendingAck {
+    libera::net::udp::endpoint destination;
+    std::array<std::uint8_t, 4> packet{};
+};
+
 class LoopbackCube final {
 public:
     LoopbackCube()
@@ -139,9 +144,17 @@ public:
     void dropNextStatus(int count = 1) { dropStatus.store(count); }
     void malformNextStatus(int count = 1) { malformedStatus.store(count); }
     void holdStatus(bool value) { holdStatuses.store(value); }
+    void clearPendingStatuses() {
+        std::lock_guard<std::mutex> lock(mutex);
+        pendingStatuses.clear();
+    }
     void setAckReorder(bool value) { reorderAcks.store(value); }
     void setAckDuplicate(bool value) { duplicateAcks.store(value); }
     void dropNextAck(int count = 1) { dropAcks.store(count); }
+    void holdNextAcks(int count, std::uint16_t excludedSenderPort = 0) {
+        holdAckExcludedSenderPort.store(excludedSenderPort);
+        holdAcks.store(count);
+    }
 
     std::vector<Event> events() const {
         std::lock_guard<std::mutex> lock(mutex);
@@ -159,6 +172,37 @@ public:
         const auto snapshot = events();
         return static_cast<std::size_t>(std::count_if(
             snapshot.begin(), snapshot.end(), [](const Event& event) { return event.data; }));
+    }
+
+    std::optional<std::uint16_t> lastCommandSender(std::uint8_t command) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto found = std::find_if(
+            history.rbegin(), history.rend(), [&](const Event& event) {
+                return !event.data && event.command == command;
+            });
+        if (found == history.rend()) return std::nullopt;
+        return found->senderPort;
+    }
+
+    std::optional<std::uint16_t> waitForCommandSenderAfter(
+        std::uint8_t command,
+        std::uint64_t marker,
+        Clock::time_point deadline,
+        std::optional<std::uint16_t> excludedPort = std::nullopt) {
+        std::unique_lock<std::mutex> lock(mutex);
+        const bool found = changed.wait_until(lock, deadline, [&] {
+            return std::any_of(history.begin(), history.end(), [&](const Event& event) {
+                return event.sequence > marker && !event.data && event.command == command &&
+                       (!excludedPort || event.senderPort != *excludedPort);
+            });
+        });
+        if (!found) return std::nullopt;
+        const auto event = std::find_if(
+            history.rbegin(), history.rend(), [&](const Event& value) {
+                return value.sequence > marker && !value.data && value.command == command &&
+                       (!excludedPort || value.senderPort != *excludedPort);
+            });
+        return event->senderPort;
     }
 
     std::uint64_t lastSequence() const {
@@ -193,6 +237,24 @@ public:
         });
     }
 
+    bool waitForDataQuiet(
+        std::chrono::milliseconds quietPeriod,
+        Clock::time_point deadline) {
+        std::unique_lock<std::mutex> lock(mutex);
+        auto observedCount = history.size();
+        auto quietUntil = Clock::now() + quietPeriod;
+        while (Clock::now() < deadline) {
+            changed.wait_until(lock, std::min(quietUntil, deadline));
+            if (history.size() != observedCount) {
+                observedCount = history.size();
+                quietUntil = Clock::now() + quietPeriod;
+                continue;
+            }
+            if (Clock::now() >= quietUntil) return true;
+        }
+        return false;
+    }
+
     std::vector<std::uint16_t> waitForPendingPorts(
         std::size_t distinctCount, Clock::time_point deadline) {
         std::unique_lock<std::mutex> lock(mutex);
@@ -212,6 +274,43 @@ public:
             if (std::find(ports.begin(), ports.end(), port) == ports.end()) ports.push_back(port);
         }
         return ports;
+    }
+
+    bool waitForPendingStatus(std::uint16_t port, Clock::time_point deadline) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_until(lock, deadline, [&] {
+            return std::any_of(
+                pendingStatuses.begin(), pendingStatuses.end(),
+                [&](const PendingStatus& pending) {
+                    return pending.destination.port() == port;
+                });
+        });
+    }
+
+    std::optional<std::uint16_t> waitForPendingPortDifferentFrom(
+        std::uint16_t retiredPort,
+        Clock::time_point deadline) {
+        std::unique_lock<std::mutex> lock(mutex);
+        const bool found = changed.wait_until(lock, deadline, [&] {
+            return std::any_of(
+                pendingStatuses.begin(), pendingStatuses.end(),
+                [&](const PendingStatus& pending) {
+                    return pending.destination.port() != retiredPort;
+                });
+        });
+        if (!found) return std::nullopt;
+        const auto pending = std::find_if(
+            pendingStatuses.rbegin(), pendingStatuses.rend(),
+            [&](const PendingStatus& value) {
+                return value.destination.port() != retiredPort;
+            });
+        return pending->destination.port();
+    }
+
+    std::optional<std::uint16_t> latestPendingStatusPort() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (pendingStatuses.empty()) return std::nullopt;
+        return pendingStatuses.back().destination.port();
     }
 
     bool waitForPendingStatusAfterOutputOn(
@@ -243,9 +342,111 @@ public:
             if (found == pendingStatuses.end()) return false;
             pending = *found;
             pendingStatuses.erase(found);
+            statusResponsesToRelease.push_back(pending);
+            changed.notify_all();
         }
-        return !commandSocket.send_to(
+        return true;
+    }
+
+    bool releaseOnePendingMalformed(std::uint16_t port) {
+        PendingStatus pending;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto found = std::find_if(
+                pendingStatuses.begin(), pendingStatuses.end(),
+                [&](const PendingStatus& value) { return value.destination.port() == port; });
+            if (found == pendingStatuses.end()) return false;
+            pending = *found;
+        }
+        pending.packet[2] = 0xff;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            statusResponsesToRelease.push_back(pending);
+            changed.notify_all();
+        }
+        return true;
+    }
+
+    bool releaseOnePendingWrongSerial(std::uint16_t port) {
+        PendingStatus pending;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto found = std::find_if(
+                pendingStatuses.begin(), pendingStatuses.end(),
+                [&](const PendingStatus& value) { return value.destination.port() == port; });
+            if (found == pendingStatuses.end()) return false;
+            pending = *found;
+        }
+        pending.packet[26] = 0x99;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            statusResponsesToRelease.push_back(pending);
+            changed.notify_all();
+        }
+        return true;
+    }
+
+    bool releaseOnePendingFromWrongSender(std::uint16_t port) {
+        PendingStatus pending;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto found = std::find_if(
+                pendingStatuses.begin(), pendingStatuses.end(),
+                [&](const PendingStatus& value) { return value.destination.port() == port; });
+            if (found == pendingStatuses.end()) return false;
+            pending = *found;
+        }
+        libera::net::UdpSocket wrongSender(*io);
+        std::error_code error;
+        const auto loopback = libera::net::asio::ip::make_address("127.0.0.1", error);
+        if (error || wrongSender.open_v4(false) || wrongSender.bind(loopback, 0, false)) {
+            return false;
+        }
+        return !wrongSender.send_to(
             pending.packet.data(), pending.packet.size(), pending.destination, 20ms, false);
+    }
+
+    bool waitForPendingAcks(std::size_t count, Clock::time_point deadline) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_until(lock, deadline, [&] {
+            return pendingAcks.size() >= count;
+        });
+    }
+
+    std::vector<std::uint16_t> pendingAckPorts() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<std::uint16_t> ports;
+        ports.reserve(pendingAcks.size());
+        for (const auto& pending : pendingAcks) {
+            ports.push_back(pending.destination.port());
+        }
+        return ports;
+    }
+
+    std::vector<std::uint8_t> pendingAckMessageNumbers() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<std::uint8_t> messageNumbers;
+        messageNumbers.reserve(pendingAcks.size());
+        for (const auto& pending : pendingAcks) {
+            messageNumbers.push_back(pending.packet[1]);
+        }
+        return messageNumbers;
+    }
+
+    bool aliasOldestAckToFirstCurrentAck() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (pendingAcks.size() < 2) return false;
+        pendingAcks.front().packet[1] = pendingAcks[1].packet[1];
+        return true;
+    }
+
+    bool releaseOldestPendingAck() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (pendingAcks.empty()) return false;
+        acknowledgementsToRelease.push_back(pendingAcks.front());
+        pendingAcks.erase(pendingAcks.begin());
+        changed.notify_all();
+        return true;
     }
 
 private:
@@ -307,6 +508,20 @@ private:
 
     void commandLoop() {
         while (running.load()) {
+            std::optional<PendingStatus> pendingRelease;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!statusResponsesToRelease.empty()) {
+                    pendingRelease = statusResponsesToRelease.front();
+                    statusResponsesToRelease.erase(statusResponsesToRelease.begin());
+                }
+            }
+            if (pendingRelease) {
+                (void)commandSocket.send_to(
+                    pendingRelease->packet.data(), pendingRelease->packet.size(),
+                    pendingRelease->destination, 20ms, false);
+                continue;
+            }
             std::array<std::uint8_t, 128> input{};
             libera::net::udp::endpoint sender;
             std::size_t received = 0;
@@ -345,6 +560,20 @@ private:
     void dataLoop() {
         std::optional<std::pair<libera::net::udp::endpoint, std::array<std::uint8_t, 4>>> heldAck;
         while (running.load()) {
+            std::optional<PendingAck> pendingRelease;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!acknowledgementsToRelease.empty()) {
+                    pendingRelease = acknowledgementsToRelease.front();
+                    acknowledgementsToRelease.erase(acknowledgementsToRelease.begin());
+                }
+            }
+            if (pendingRelease) {
+                (void)dataSocket.send_to(
+                    pendingRelease->packet.data(), pendingRelease->packet.size(),
+                    pendingRelease->destination, 20ms, false);
+                continue;
+            }
             std::array<std::uint8_t, 1600> input{};
             libera::net::udp::endpoint sender;
             std::size_t received = 0;
@@ -365,6 +594,12 @@ private:
                 LaserCubeNetConfig::CMD_GET_RINGBUFFER_FREE, input[2], 0, 0};
             writeLe16(&ack[2], bufferFree.load());
             if (consume(dropAcks)) continue;
+            if (sender.port() != holdAckExcludedSenderPort.load() && consume(holdAcks)) {
+                std::lock_guard<std::mutex> lock(mutex);
+                pendingAcks.push_back(PendingAck{sender, ack});
+                changed.notify_all();
+                continue;
+            }
             if (reorderAcks.load() && !heldAck) {
                 heldAck = std::make_pair(sender, ack);
                 continue;
@@ -399,11 +634,16 @@ private:
     std::atomic<bool> reorderAcks{false};
     std::atomic<bool> duplicateAcks{false};
     std::atomic<int> dropAcks{0};
+    std::atomic<int> holdAcks{0};
+    std::atomic<std::uint16_t> holdAckExcludedSenderPort{0};
     mutable std::mutex mutex;
     std::condition_variable changed;
     std::uint64_t sequence = 0;
     std::vector<Event> history;
     std::vector<PendingStatus> pendingStatuses;
+    std::vector<PendingStatus> statusResponsesToRelease;
+    std::vector<PendingAck> pendingAcks;
+    std::vector<PendingAck> acknowledgementsToRelease;
     std::thread commandWorker;
     std::thread dataWorker;
 };
@@ -632,8 +872,9 @@ void rotatedSocketRejectsDelayedPriorStatus() {
     cube.holdStatus(true);
     const auto first = controller.disableDark(LaserCubeNetOperation::withTimeout(150ms));
     CHECK(!first && first->evidence == LaserCubeNetRemoteEvidence::HostDarkRequested);
-    const auto oldPorts = cube.waitForPendingPorts(1, Clock::now() + 200ms);
-    CHECK(!oldPorts.empty());
+    CHECK(!cube.waitForPendingPorts(1, Clock::now() + 200ms).empty());
+    const auto oldPort = cube.latestPendingStatusPort();
+    CHECK(oldPort.has_value());
 
     cube.forceOutput(true);
     cube.setIgnoreAllOff(true);
@@ -643,13 +884,12 @@ void rotatedSocketRejectsDelayedPriorStatus() {
         second.emplace(controller.disableDark(LaserCubeNetOperation{
             Clock::now() + 2s, [&] { return cancelSecond.load(); }}));
     });
-    const auto ports = cube.waitForPendingPorts(2, Clock::now() + 500ms);
-    CHECK(ports.size() >= 2);
-    const auto newPort = *std::find_if(
-        ports.begin(), ports.end(), [&](std::uint16_t port) { return port != oldPorts.front(); });
-    CHECK(cube.releaseOnePending(oldPorts.front()));
+    const auto newPort = cube.waitForPendingPortDifferentFrom(
+        *oldPort, Clock::now() + 500ms);
+    CHECK(newPort.has_value());
+    CHECK(cube.releaseOnePending(*oldPort));
     cube.holdStatus(false);
-    CHECK(cube.releaseOnePending(newPort));
+    CHECK(cube.releaseOnePending(*newPort));
     // Observe the exact public partial-evidence state rather than inferring it
     // from server command arrival order. The report cache has independent
     // synchronization so it remains observable while the lifecycle lock is
@@ -836,6 +1076,351 @@ void blockedWorkerCannotLeakAcrossDisableReenable() {
     CHECK(controller.shutdownDark(LaserCubeNetOperation::withTimeout(500ms)));
 }
 
+void lateRetiredAckCannotSatisfyReenableStartup() {
+    LoopbackCube cube;
+    LaserCubeNetControllerInfo info(cube.status());
+    LaserCubeNetController controller(info, cube.network());
+    CHECK(controller.connectDark(info, LaserCubeNetOperation::withTimeout(500ms)));
+    installLitCallback(controller);
+    controller.startThread();
+    CHECK(controller.enableOutput(LaserCubeNetOperation::withTimeout(500ms)));
+    CHECK(cube.waitForLitPacket(Clock::now() + 1s));
+
+    // Retain one ordinary streaming ACK so it arrives only after disable has
+    // retired every acknowledgement slot owned by this output generation.
+    cube.holdNextAcks(1);
+    CHECK(cube.waitForPendingAcks(1, Clock::now() + 1s));
+    const auto priorEpochPorts = cube.pendingAckPorts();
+    CHECK(priorEpochPorts.size() == 1);
+    CHECK(controller.disableDark(LaserCubeNetOperation::withTimeout(500ms)));
+    controller.clearErrors();
+    installLitCallback(controller);
+    CHECK(cube.waitForDataQuiet(20ms, Clock::now() + 500ms));
+
+    // A fresh enable sends exactly two startup blank packets. Hold both so the
+    // test can prove that the orphan does not release their delivery barrier.
+    cube.holdNextAcks(2, priorEpochPorts.front());
+    std::mutex enableMutex;
+    std::condition_variable enableChanged;
+    bool enableFinished = false;
+    std::optional<LaserCubeNetLifecycleResult> enableResult;
+    const auto outputOnCount = cube.commandCount(LaserCubeNetConfig::CMD_SET_OUTPUT);
+    std::thread enable([&] {
+        auto result = controller.enableOutput(LaserCubeNetOperation::withTimeout(3s));
+        {
+            std::lock_guard<std::mutex> lock(enableMutex);
+            enableResult.emplace(std::move(result));
+            enableFinished = true;
+        }
+        enableChanged.notify_all();
+    });
+    CHECK(cube.waitForPendingAcks(3, Clock::now() + 500ms));
+    const auto ackPorts = cube.pendingAckPorts();
+    CHECK(ackPorts.size() == 3);
+    CHECK(ackPorts[0] != ackPorts[1]);
+    CHECK(ackPorts[1] == ackPorts[2]);
+    // Synthetically reproduce the exact wire ambiguity after uint8 wrap: the
+    // retired ACK carries the same message ID as the first current startup ACK.
+    CHECK(cube.aliasOldestAckToFirstCurrentAck());
+    const auto ackMessageNumbers = cube.pendingAckMessageNumbers();
+    CHECK(ackMessageNumbers.size() == 3);
+    CHECK(ackMessageNumbers[0] == ackMessageNumbers[1]);
+    CHECK(ackMessageNumbers[1] != ackMessageNumbers[2]);
+
+    // Release the retired ACK and one current ACK back-to-back. Even together
+    // they cannot satisfy the two-ACK startup barrier for the current epoch.
+    CHECK(cube.releaseOldestPendingAck());
+    CHECK(cube.releaseOldestPendingAck());
+    {
+        std::unique_lock<std::mutex> lock(enableMutex);
+        const bool finishedEarly =
+            enableChanged.wait_for(lock, 20ms, [&] { return enableFinished; });
+        CHECK(!finishedEarly);
+    }
+    CHECK(cube.commandCount(LaserCubeNetConfig::CMD_SET_OUTPUT) == outputOnCount);
+
+    CHECK(cube.releaseOldestPendingAck());
+    {
+        std::unique_lock<std::mutex> lock(enableMutex);
+        CHECK(enableChanged.wait_until(
+            lock, Clock::now() + 500ms, [&] { return enableFinished; }));
+    }
+    enable.join();
+    CHECK(enableResult.has_value() && *enableResult);
+    CHECK(cube.commandCount(LaserCubeNetConfig::CMD_SET_OUTPUT) == outputOnCount + 1);
+
+    const auto errors = controller.getErrors();
+    CHECK(std::none_of(errors.begin(), errors.end(), [](const auto& error) {
+        return error.code == "network.packet_loss";
+    }));
+    const auto recent = controller.getRecentEvent();
+    CHECK(!recent || recent->code != "network.packet_loss");
+    CHECK(controller.shutdownDark(LaserCubeNetOperation::withTimeout(500ms)));
+}
+
+void failedStartupAckEpochCannotPoisonRetry() {
+    LoopbackCube cube;
+    LaserCubeNetControllerInfo info(cube.status());
+    LaserCubeNetController controller(info, cube.network());
+    CHECK(controller.connectDark(info, LaserCubeNetOperation::withTimeout(500ms)));
+    installLitCallback(controller);
+    controller.startThread();
+
+    // Deliver one startup ACK and hold the other past generic one-second slot
+    // cleanup. Cleanup must not masquerade as the second delivery proof.
+    cube.holdNextAcks(1);
+    const auto outputOnCount = cube.commandCount(LaserCubeNetConfig::CMD_SET_OUTPUT);
+    const auto first = controller.enableOutput(LaserCubeNetOperation::withTimeout(1200ms));
+    CHECK(!first && first.error() == std::errc::timed_out);
+    CHECK(cube.commandCount(LaserCubeNetConfig::CMD_SET_OUTPUT) == outputOnCount);
+    CHECK(cube.waitForPendingAcks(1, Clock::now() + 500ms));
+    const auto failedEpochPorts = cube.pendingAckPorts();
+    CHECK(failedEpochPorts.size() == 1);
+
+    controller.clearErrors();
+    const auto retry = controller.enableOutput(LaserCubeNetOperation::withTimeout(500ms));
+    CHECK(retry && retry->evidence == LaserCubeNetRemoteEvidence::DeviceReportedEnabled);
+    CHECK(cube.releaseOldestPendingAck());
+    const auto errors = controller.getErrors();
+    CHECK(std::none_of(errors.begin(), errors.end(), [](const auto& error) {
+        return error.code == "network.packet_loss";
+    }));
+    CHECK(controller.shutdownDark(LaserCubeNetOperation::withTimeout(500ms)));
+}
+
+void directQueryUsesExclusiveUnpublishedEpoch() {
+    LoopbackCube cube;
+    LaserCubeNetControllerInfo info(cube.status());
+    LaserCubeNetController controller(info, cube.network());
+    CHECK(controller.connectDark(info, LaserCubeNetOperation::withTimeout(500ms)));
+
+    cube.clearPendingStatuses();
+    cube.holdStatus(true);
+    const auto firstMarker = cube.lastSequence();
+    const auto firstBarrier = Clock::now();
+    const auto first = controller.queryFreshStatus(
+        LaserCubeNetOperation::withTimeout(80ms), firstBarrier);
+    CHECK(!first && first.error() == std::errc::timed_out);
+    const auto firstPort = cube.waitForCommandSenderAfter(
+        LaserCubeNetConfig::CMD_GET_FULL_INFO,
+        firstMarker,
+        Clock::now() + 200ms);
+    CHECK(firstPort.has_value());
+
+    std::mutex queryMutex;
+    std::condition_variable queryChanged;
+    bool queryFinished = false;
+    std::optional<libera::expected<LaserCubeNetStatus>> second;
+    const auto secondBarrier = Clock::now();
+    const auto secondMarker = cube.lastSequence();
+    std::thread query([&] {
+        auto result = controller.queryFreshStatus(
+            LaserCubeNetOperation::withTimeout(5s), secondBarrier);
+        {
+            std::lock_guard<std::mutex> lock(queryMutex);
+            second.emplace(std::move(result));
+            queryFinished = true;
+        }
+        queryChanged.notify_all();
+    });
+    const auto secondPort = cube.waitForCommandSenderAfter(
+        LaserCubeNetConfig::CMD_GET_FULL_INFO,
+        secondMarker,
+        Clock::now() + 500ms,
+        firstPort);
+    CHECK(secondPort.has_value());
+    CHECK(cube.releaseOnePending(*firstPort));
+    {
+        std::unique_lock<std::mutex> lock(queryMutex);
+        CHECK(!queryChanged.wait_for(lock, 20ms, [&] { return queryFinished; }));
+    }
+    cube.holdStatus(false);
+    query.join();
+    CHECK(second.has_value() && *second);
+    CHECK(second->value().probeEpochStartedAt > secondBarrier);
+    CHECK(second->value().lastSeen > second->value().probeEpochStartedAt);
+
+    const auto cachedBefore = controller.getLatestStatus();
+    CHECK(cachedBefore && cachedBefore->bufferMax == 1000);
+    const auto bufferBefore = controller.getBufferState();
+    CHECK(bufferBefore && bufferBefore->totalBufferPoints == 1000);
+    cube.forceBuffer(2500, 3000);
+    const auto raw = controller.queryFreshStatus(
+        LaserCubeNetOperation::withTimeout(500ms), Clock::now());
+    CHECK(raw && raw->bufferMax == 3000 && raw->bufferFree == 2500);
+    const auto stillCached = controller.getLatestStatus();
+    CHECK(stillCached && stillCached->bufferMax == 1000);
+    const auto bufferStillCached = controller.getBufferState();
+    CHECK(bufferStillCached && bufferStillCached->totalBufferPoints == 1000);
+    controller.updateDiscoveredStatus(*raw);
+    const auto published = controller.getLatestStatus();
+    CHECK(published && published->bufferMax == 3000);
+    CHECK(controller.shutdownDark(LaserCubeNetOperation::withTimeout(500ms)));
+}
+
+void directQueryDoesNotStarveStreamingAndSerializes() {
+    LoopbackCube cube;
+    LaserCubeNetControllerInfo info(cube.status());
+    LaserCubeNetController controller(info, cube.network());
+    CHECK(controller.connectDark(info, LaserCubeNetOperation::withTimeout(500ms)));
+    installLitCallback(controller);
+    controller.startThread();
+    CHECK(controller.enableOutput(LaserCubeNetOperation::withTimeout(500ms)));
+    CHECK(cube.waitForLitPacket(Clock::now() + 1s));
+
+    cube.forceBuffer(1000, 1000);
+    cube.holdStatus(true);
+    std::optional<libera::expected<LaserCubeNetStatus>> heldResult;
+    std::thread held([&] {
+        heldResult.emplace(controller.queryFreshStatus(
+            LaserCubeNetOperation::withTimeout(5s), Clock::now()));
+    });
+    const auto ports = cube.waitForPendingPorts(1, Clock::now() + 500ms);
+    CHECK(!ports.empty());
+    const auto dataBefore = cube.dataCount();
+    CHECK(cube.waitForData(dataBefore + 1, Clock::now() + 500ms));
+
+    const auto blocked = controller.queryFreshStatus(
+        LaserCubeNetOperation::withTimeout(50ms), Clock::now());
+    CHECK(!blocked && blocked.error() == std::errc::timed_out);
+    cube.holdStatus(false);
+    held.join();
+    CHECK(heldResult.has_value() && *heldResult);
+
+    const auto deadline = Clock::now() + 20ms;
+    const auto invalid = controller.queryFreshStatus(
+        LaserCubeNetOperation{deadline, [] { return false; }}, deadline);
+    CHECK(!invalid && invalid.error() == std::errc::invalid_argument);
+    CHECK(controller.shutdownDark(LaserCubeNetOperation::withTimeout(500ms)));
+}
+
+void directQueryRejectsInvalidResponsesAndCancelsPromptly() {
+    LoopbackCube cube;
+    LaserCubeNetControllerInfo info(cube.status());
+    LaserCubeNetController controller(info, cube.network());
+    CHECK(controller.connectDark(info, LaserCubeNetOperation::withTimeout(500ms)));
+    cube.holdStatus(true);
+
+    std::mutex queryMutex;
+    std::condition_variable queryChanged;
+    bool queryFinished = false;
+    std::optional<libera::expected<LaserCubeNetStatus>> queryResult;
+    const auto queryMarker = cube.lastSequence();
+    std::thread query([&] {
+        auto result = controller.queryFreshStatus(
+            LaserCubeNetOperation::withTimeout(5s), Clock::now());
+        {
+            std::lock_guard<std::mutex> lock(queryMutex);
+            queryResult.emplace(std::move(result));
+            queryFinished = true;
+        }
+        queryChanged.notify_all();
+    });
+    const auto queryPort = cube.waitForCommandSenderAfter(
+        LaserCubeNetConfig::CMD_GET_FULL_INFO,
+        queryMarker,
+        Clock::now() + 500ms);
+    CHECK(queryPort.has_value());
+    const auto port = *queryPort;
+    CHECK(cube.waitForPendingStatus(port, Clock::now() + 500ms));
+    CHECK(cube.releaseOnePendingFromWrongSender(port));
+    CHECK(cube.releaseOnePendingMalformed(port));
+    CHECK(cube.releaseOnePendingWrongSerial(port));
+    {
+        std::unique_lock<std::mutex> lock(queryMutex);
+        CHECK(!queryChanged.wait_for(lock, 20ms, [&] { return queryFinished; }));
+    }
+    cube.holdStatus(false);
+    query.join();
+    CHECK(queryResult.has_value() && *queryResult);
+
+    cube.holdStatus(true);
+    std::atomic<bool> cancelled{false};
+    std::optional<libera::expected<LaserCubeNetStatus>> cancelledResult;
+    const auto cancelledMarker = cube.lastSequence();
+    std::thread cancelledQuery([&] {
+        cancelledResult.emplace(controller.queryFreshStatus(
+            LaserCubeNetOperation{Clock::now() + 5s, [&] { return cancelled.load(); }},
+            Clock::now()));
+    });
+    CHECK(cube.waitForCommandSenderAfter(
+        LaserCubeNetConfig::CMD_GET_FULL_INFO,
+        cancelledMarker,
+        Clock::now() + 500ms,
+        port));
+    const auto cancelStarted = Clock::now();
+    cancelled.store(true);
+    cancelledQuery.join();
+    CHECK(Clock::now() - cancelStarted < 100ms);
+    CHECK(cancelledResult.has_value() && !*cancelledResult);
+    CHECK(cancelledResult->error() == std::errc::operation_canceled);
+
+    cube.holdStatus(false);
+    CHECK(controller.shutdownDark(LaserCubeNetOperation::withTimeout(500ms)));
+}
+
+void closeInvalidatesDirectQueryGeneration() {
+    LoopbackCube cube;
+    LaserCubeNetControllerInfo info(cube.status());
+    LaserCubeNetController controller(info, cube.network());
+    CHECK(controller.connectDark(info, LaserCubeNetOperation::withTimeout(500ms)));
+    cube.clearPendingStatuses();
+    cube.holdStatus(true);
+
+    std::optional<libera::expected<LaserCubeNetStatus>> oldResult;
+    const auto oldMarker = cube.lastSequence();
+    std::thread oldQuery([&] {
+        oldResult.emplace(controller.queryFreshStatus(
+            LaserCubeNetOperation::withTimeout(5s), Clock::now()));
+    });
+    const auto oldPort = cube.waitForCommandSenderAfter(
+        LaserCubeNetConfig::CMD_GET_FULL_INFO,
+        oldMarker,
+        Clock::now() + 500ms);
+    CHECK(oldPort.has_value());
+    const auto closeStarted = Clock::now();
+    controller.close();
+    oldQuery.join();
+    CHECK(Clock::now() - closeStarted < 100ms);
+    CHECK(oldResult.has_value() && !*oldResult);
+
+    cube.holdStatus(false);
+    CHECK(controller.connectDark(info, LaserCubeNetOperation::withTimeout(500ms)));
+    cube.holdStatus(true);
+    const auto newMarker = cube.lastSequence();
+    std::mutex queryMutex;
+    std::condition_variable queryChanged;
+    bool queryFinished = false;
+    std::optional<libera::expected<LaserCubeNetStatus>> newResult;
+    std::thread newQuery([&] {
+        auto result = controller.queryFreshStatus(
+            LaserCubeNetOperation::withTimeout(5s), Clock::now());
+        {
+            std::lock_guard<std::mutex> lock(queryMutex);
+            newResult.emplace(std::move(result));
+            queryFinished = true;
+        }
+        queryChanged.notify_all();
+    });
+    const auto newPort = cube.waitForCommandSenderAfter(
+        LaserCubeNetConfig::CMD_GET_FULL_INFO,
+        newMarker,
+        Clock::now() + 500ms,
+        oldPort);
+    CHECK(newPort.has_value());
+    CHECK(cube.releaseOnePending(*oldPort));
+    {
+        std::unique_lock<std::mutex> lock(queryMutex);
+        CHECK(!queryChanged.wait_for(lock, 20ms, [&] { return queryFinished; }));
+    }
+    // Let the next probe on the new epoch receive a freshly generated reply;
+    // this avoids selecting among multiple intentionally retained retries.
+    cube.holdStatus(false);
+    newQuery.join();
+    CHECK(newResult.has_value() && *newResult);
+    CHECK(controller.shutdownDark(LaserCubeNetOperation::withTimeout(500ms)));
+}
+
 class CountingManager final : public LaserCubeNetManager {
 public:
     explicit CountingManager(LaserCubeNetNetworkConfig config)
@@ -926,6 +1511,12 @@ int main() {
     cancellationPreservesPartialEvidence();
     disablePreemptsBlockedEnableCommit();
     blockedWorkerCannotLeakAcrossDisableReenable();
+    lateRetiredAckCannotSatisfyReenableStartup();
+    failedStartupAckEpochCannotPoisonRetry();
+    directQueryUsesExclusiveUnpublishedEpoch();
+    directQueryDoesNotStarveStreamingAndSerializes();
+    directQueryRejectsInvalidResponsesAndCancelsPromptly();
+    closeInvalidatesDirectQueryGeneration();
     managerDropsFailedInstanceAndReconnectStaysDark();
     failedShutdownNeverClaimsConfirmation();
     return 0;

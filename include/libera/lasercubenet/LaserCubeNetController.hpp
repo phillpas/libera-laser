@@ -104,6 +104,12 @@ public:
     std::optional<core::BufferState> getBufferState() const override;
     void updateDiscoveredStatus(const LaserCubeNetStatus& status);
     std::optional<LaserCubeNetStatus> getLatestStatus() const;
+    /// Query through a controller-owned receive epoch created after notBefore.
+    /// The operation is bounded and returns raw attributed status without
+    /// publishing it or mutating cached limits via updateDiscoveredStatus().
+    libera::expected<LaserCubeNetStatus> queryFreshStatus(
+        const LaserCubeNetOperation& operation,
+        std::chrono::steady_clock::time_point notBefore);
 
 protected:
     void run() override;
@@ -122,9 +128,12 @@ private:
     bool sendDataLocked(const std::uint8_t* buffer, std::size_t size);
     bool sendCommand(std::uint8_t cmd, const std::uint8_t* payload, std::size_t size);
     bool sendCommandLocked(std::uint8_t cmd, const std::uint8_t* payload, std::size_t size);
+    bool rotateDataSocketLocked();
     bool rotateCommandSocketLocked();
     bool sendStartupBlankLocked(std::size_t packetCount = 2);
-    bool confirmStartupDeliveryLocked(const LaserCubeNetOperation& operation);
+    bool confirmStartupDeliveryLocked(
+        const LaserCubeNetOperation& operation,
+        std::uint64_t acknowledgementTarget);
     bool drainCommandResponsesLocked(const LaserCubeNetOperation& operation);
     libera::expected<LaserCubeNetStatus> requestFreshStatus(
         const LaserCubeNetOperation& operation,
@@ -138,10 +147,11 @@ private:
     bool commitEnableIntentLocked(std::uint64_t expectedGeneration) noexcept;
     void setLastLifecycleReport(const LaserCubeNetLifecycleReport& report);
     void bestEffortOffLocked() noexcept;
+    void invalidateStatusQueryLocked();
     bool lockLifecycle(
         const LaserCubeNetOperation& operation,
         std::unique_lock<std::timed_mutex>& lock);
-    void checkAcksLocked();
+    void checkAcksLocked(bool retireStaleSlots = true);
 
     int getTotalBufferCapacity() const;
 
@@ -165,6 +175,11 @@ private:
     std::atomic<std::uint32_t> maxPointRate{60000};
     std::atomic<bool> networkConnected{false};
     std::atomic<bool> reconnectRequested{false};
+    std::atomic<std::uint64_t> connectionGeneration{0};
+
+    std::timed_mutex statusQueryOperationMutex;
+    std::mutex statusQuerySocketMutex;
+    std::shared_ptr<net::UdpSocket> statusQuerySocket;
 
     std::uint8_t messageNumber{0};
     std::uint8_t frameNumber{0};
@@ -176,6 +191,7 @@ private:
     // A default-constructed time_point (epoch) means "slot empty".
     std::array<std::chrono::steady_clock::time_point, 256> messageTimes{};
     int pendingAckCount{0};
+    std::uint64_t acknowledgedMessageCount{0};
 
     // Timing helpers for buffer estimation and health tracking.
     std::chrono::steady_clock::time_point lastAckTime{};

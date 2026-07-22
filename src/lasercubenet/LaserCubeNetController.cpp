@@ -17,6 +17,7 @@ namespace error_types = libera::core::error_types;
 
 constexpr auto ackDisconnectThreshold = std::chrono::milliseconds(500);
 constexpr auto reconnectRetryDelay = std::chrono::milliseconds(100);
+constexpr std::size_t startupBlankPacketCount = 2;
 
 LaserCubeNetController::LaserCubeNetController(LaserCubeNetNetworkConfig networkConfigValue)
     : networkConfig(std::move(networkConfigValue)) {
@@ -57,6 +58,153 @@ void LaserCubeNetController::updateDiscoveredStatus(const LaserCubeNetStatus& st
 std::optional<LaserCubeNetStatus> LaserCubeNetController::getLatestStatus() const {
     std::lock_guard<std::mutex> lock(latestStatusMutex);
     return latestStatus;
+}
+
+libera::expected<LaserCubeNetStatus> LaserCubeNetController::queryFreshStatus(
+    const LaserCubeNetOperation& operation,
+    const std::chrono::steady_clock::time_point notBefore) {
+    if (notBefore >= operation.deadline) {
+        return libera::unexpected(std::make_error_code(std::errc::invalid_argument));
+    }
+
+    std::unique_lock<std::timed_mutex> queryLock(statusQueryOperationMutex, std::defer_lock);
+    while (!operationStopped(operation)) {
+        const auto nextPoll = std::min(
+            operation.deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(2));
+        if (queryLock.try_lock_until(nextPoll)) break;
+    }
+    if (!queryLock.owns_lock()) {
+        return libera::unexpected(std::make_error_code(
+            operation.cancelled && operation.cancelled()
+                ? std::errc::operation_canceled
+                : std::errc::timed_out));
+    }
+
+    while (std::chrono::steady_clock::now() <= notBefore && !operationStopped(operation)) {
+        std::this_thread::yield();
+    }
+    if (operationStopped(operation)) {
+        return libera::unexpected(std::make_error_code(
+            operation.cancelled && operation.cancelled()
+                ? std::errc::operation_canceled
+                : std::errc::timed_out));
+    }
+
+    std::shared_ptr<asio::io_context> queryIo;
+    net::udp::endpoint expectedEndpoint;
+    std::string bindAddressText;
+    std::string expectedSerial;
+    std::uint64_t expectedGeneration = 0;
+    {
+        std::unique_lock<std::timed_mutex> lifecycleLock(lifecycleMutex, std::defer_lock);
+        if (!lockLifecycle(operation, lifecycleLock)) {
+            return libera::unexpected(std::make_error_code(
+                operation.cancelled && operation.cancelled()
+                    ? std::errc::operation_canceled
+                    : std::errc::timed_out));
+        }
+        if (!networkConnected.load(std::memory_order_acquire) || !io) {
+            return libera::unexpected(std::make_error_code(std::errc::not_connected));
+        }
+        queryIo = io;
+        expectedEndpoint = commandEndpoint;
+        bindAddressText = networkConfig.localBindAddress;
+        expectedGeneration = connectionGeneration.load(std::memory_order_acquire);
+        const auto currentStatus = getLatestStatus();
+        if (!currentStatus || currentStatus->serialNumber.empty()) {
+            return libera::unexpected(std::make_error_code(std::errc::not_connected));
+        }
+        expectedSerial = currentStatus->serialNumber;
+    }
+
+    auto replacement = std::make_shared<net::UdpSocket>(*queryIo);
+    std::shared_ptr<net::UdpSocket> retired;
+    std::chrono::steady_clock::time_point probeEpochStartedAt;
+    {
+        std::lock_guard<std::mutex> socketLock(statusQuerySocketMutex);
+        if (!networkConnected.load(std::memory_order_acquire) ||
+            connectionGeneration.load(std::memory_order_acquire) != expectedGeneration) {
+            return libera::unexpected(std::make_error_code(std::errc::not_connected));
+        }
+        if (auto error = replacement->open_v4(false)) {
+            return libera::unexpected(error);
+        }
+        std::error_code addressError;
+        const auto bindAddress = asio::ip::make_address(bindAddressText, addressError);
+        if (addressError) return libera::unexpected(addressError);
+        if (auto error = replacement->bind(bindAddress, 0, false)) {
+            return libera::unexpected(error);
+        }
+        probeEpochStartedAt = std::chrono::steady_clock::now();
+        if (probeEpochStartedAt <= notBefore) {
+            return libera::unexpected(std::make_error_code(std::errc::timed_out));
+        }
+        retired = std::move(statusQuerySocket);
+        statusQuerySocket = replacement;
+    }
+    if (retired) retired->close();
+
+    const std::uint8_t query = LaserCubeNetConfig::CMD_GET_FULL_INFO;
+    std::array<std::uint8_t, 64> buffer{};
+    while (!operationStopped(operation)) {
+        const auto beforeSend = std::chrono::steady_clock::now();
+        const auto sendRemaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            operation.deadline - beforeSend);
+        const auto sendTimeout = std::max(
+            std::chrono::milliseconds(1), std::min(networkConfig.sendTimeout, sendRemaining));
+        if (auto error = replacement->send_to(
+                &query, 1, expectedEndpoint, sendTimeout, false)) {
+            if (error == asio::error::operation_aborted) break;
+            return libera::unexpected(error);
+        }
+
+        const auto responseWindowEnds = std::min(
+            operation.deadline,
+            std::chrono::steady_clock::now() + networkConfig.receivePollTimeout);
+        while (!operationStopped(operation) &&
+               std::chrono::steady_clock::now() < responseWindowEnds) {
+            const auto receiveEnds = std::min(
+                responseWindowEnds,
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(5));
+            const auto timeout = std::max(
+                std::chrono::milliseconds(1),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    receiveEnds - std::chrono::steady_clock::now()));
+            net::udp::endpoint sender;
+            std::size_t received = 0;
+            const auto error = replacement->recv_from(
+                buffer.data(), buffer.size(), sender, received, timeout, false);
+            if (error == asio::error::timed_out) continue;
+            if (error == asio::error::operation_aborted) break;
+            if (error) return libera::unexpected(error);
+            const auto receivedAt = std::chrono::steady_clock::now();
+            if (sender != expectedEndpoint || receivedAt <= probeEpochStartedAt) continue;
+            auto status = LaserCubeNetStatus::parse(buffer.data(), received);
+            if (!status || status->serialNumber != expectedSerial) continue;
+            std::unique_lock<std::timed_mutex> finalLock(lifecycleMutex, std::defer_lock);
+            if (!lockLifecycle(operation, finalLock)) {
+                return libera::unexpected(std::make_error_code(
+                    operation.cancelled && operation.cancelled()
+                        ? std::errc::operation_canceled
+                        : std::errc::timed_out));
+            }
+            if (!networkConnected.load(std::memory_order_acquire) ||
+                connectionGeneration.load(std::memory_order_acquire) != expectedGeneration ||
+                commandEndpoint != expectedEndpoint) {
+                return libera::unexpected(std::make_error_code(std::errc::not_connected));
+            }
+            status->ipAddress = sender.address().to_string();
+            status->lastSeen = receivedAt;
+            status->probeEpochStartedAt = probeEpochStartedAt;
+            return *status;
+        }
+    }
+    return libera::unexpected(std::make_error_code(
+        operation.cancelled && operation.cancelled()
+            ? std::errc::operation_canceled
+            : networkConnected.load(std::memory_order_acquire)
+                ? std::errc::timed_out
+                : std::errc::not_connected));
 }
 
 libera::expected<void> LaserCubeNetController::connect(const LaserCubeNetControllerInfo& info) {
@@ -122,18 +270,25 @@ LaserCubeNetLifecycleResult LaserCubeNetController::enableOutput(
 
     // Push the configured rate and a real blank startup packet while output is
     // still remotely off. The streaming worker is gated until on is confirmed.
-    if (!rotateCommandSocketLocked()) {
+    // Give this enable generation a fresh ACK receive epoch. The replacement
+    // socket is bound before the old one is retired, so delayed ACKs cannot be
+    // delivered to a reused local port and alias a wrapped 8-bit message ID.
+    if (!rotateDataSocketLocked() || !rotateCommandSocketLocked()) {
+        bestEffortOffLocked();
+        clearOutputIntentLocked();
         return LaserCubeNetLifecycleResult::failure(
             std::make_error_code(std::errc::io_error));
     }
     const auto desiredRate = getPointRate();
     core::ByteBuffer ratePayload;
     ratePayload.appendUInt32(desiredRate);
+    const auto startupAcknowledgementTarget =
+        acknowledgedMessageCount + startupBlankPacketCount;
     if (!sendCommandLocked(
             LaserCubeNetConfig::CMD_SET_ILDA_RATE,
             ratePayload.data(), ratePayload.size()) ||
-        !sendStartupBlankLocked() ||
-        !confirmStartupDeliveryLocked(operation) ||
+        !sendStartupBlankLocked(startupBlankPacketCount) ||
+        !confirmStartupDeliveryLocked(operation, startupAcknowledgementTarget) ||
         !drainCommandResponsesLocked(operation)) {
         bestEffortOffLocked();
         clearOutputIntentLocked();
@@ -259,6 +414,7 @@ void LaserCubeNetController::setLastLifecycleReport(
 }
 
 libera::expected<void> LaserCubeNetController::connectToStatus(const LaserCubeNetStatus& status) {
+    invalidateStatusQueryLocked();
     if (auto configError = networkConfig.validate()) {
         recordConnectionError(error_types::network::connectFailed);
         return libera::unexpected(configError);
@@ -367,6 +523,7 @@ bool LaserCubeNetController::reconnectToLatestStatus() {
 
 void LaserCubeNetController::close() {
     std::lock_guard<std::timed_mutex> lock(lifecycleMutex);
+    invalidateStatusQueryLocked();
     clearOutputIntentLocked();
     clearContentSource();
     networkConnected.store(false, std::memory_order_relaxed);
@@ -652,13 +809,40 @@ bool LaserCubeNetController::sendCommandLocked(
     return true;
 }
 
-bool LaserCubeNetController::rotateCommandSocketLocked() {
-    if (commandSocket) {
-        commandSocket->close();
+bool LaserCubeNetController::rotateDataSocketLocked() {
+    auto replacement = std::make_unique<net::UdpSocket>(*io);
+    if (auto error = replacement->open_v4()) {
+        recordConnectionError(error_types::network::connectFailed);
+        networkConnected.store(false, std::memory_order_relaxed);
+        return false;
     }
 
-    commandSocket = std::make_unique<net::UdpSocket>(*io);
-    if (auto error = commandSocket->open_v4()) {
+    std::error_code addressError;
+    const auto bindAddress = libera::net::asio::ip::make_address(
+        networkConfig.localBindAddress, addressError);
+    if (addressError || replacement->bind(bindAddress, 0)) {
+        recordConnectionError(error_types::network::connectFailed);
+        networkConnected.store(false, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Keep the previous port occupied until its replacement has bound. This
+    // makes each enable generation's ACK destination unambiguously distinct.
+    if (dataSocket) {
+        dataSocket->close();
+    }
+    dataSocket = std::move(replacement);
+    messageTimes.fill(std::chrono::steady_clock::time_point{});
+    pendingAckCount = 0;
+    acknowledgedMessageCount = 0;
+    lastAckTime = std::chrono::steady_clock::now();
+    lastAckWarningTime = std::chrono::steady_clock::time_point{};
+    return true;
+}
+
+bool LaserCubeNetController::rotateCommandSocketLocked() {
+    auto replacement = std::make_unique<net::UdpSocket>(*io);
+    if (auto error = replacement->open_v4()) {
         recordConnectionError(error_types::network::connectFailed);
         networkConnected.store(false, std::memory_order_relaxed);
         clearOutputIntentLocked();
@@ -668,13 +852,26 @@ bool LaserCubeNetController::rotateCommandSocketLocked() {
     std::error_code addressError;
     const auto bindAddress = libera::net::asio::ip::make_address(
         networkConfig.localBindAddress, addressError);
-    if (addressError || commandSocket->bind(bindAddress, 0)) {
+    if (addressError || replacement->bind(bindAddress, 0)) {
         recordConnectionError(error_types::network::connectFailed);
         networkConnected.store(false, std::memory_order_relaxed);
         clearOutputIntentLocked();
         return false;
     }
+    if (commandSocket) commandSocket->close();
+    commandSocket = std::move(replacement);
     return true;
+}
+
+void LaserCubeNetController::invalidateStatusQueryLocked() {
+    networkConnected.store(false, std::memory_order_release);
+    connectionGeneration.fetch_add(1, std::memory_order_acq_rel);
+    std::shared_ptr<net::UdpSocket> interrupted;
+    {
+        std::lock_guard<std::mutex> socketLock(statusQuerySocketMutex);
+        interrupted = statusQuerySocket;
+    }
+    if (interrupted) interrupted->interrupt();
 }
 
 bool LaserCubeNetController::sendStartupBlankLocked(const std::size_t packetCount) {
@@ -745,14 +942,21 @@ bool LaserCubeNetController::drainCommandResponsesLocked(
 }
 
 bool LaserCubeNetController::confirmStartupDeliveryLocked(
-    const LaserCubeNetOperation& operation) {
+    const LaserCubeNetOperation& operation,
+    const std::uint64_t acknowledgementTarget) {
     // This barrier proves only that the all-black startup content was accepted
     // before output-on. It is never used as output or clear evidence.
-    while (pendingAckCount > 0 && !operationStopped(operation)) {
-        checkAcksLocked();
-        if (pendingAckCount > 0) std::this_thread::yield();
+    while (acknowledgedMessageCount < acknowledgementTarget &&
+           !operationStopped(operation)) {
+        checkAcksLocked(false);
+        if (acknowledgedMessageCount < acknowledgementTarget) {
+            // Avoid monopolizing a core while the device owns the next event.
+            // The one-millisecond pause remains well inside lifecycle polling
+            // bounds and lets the UDP peer and cancellation caller run.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
-    return pendingAckCount == 0;
+    return acknowledgedMessageCount >= acknowledgementTarget;
 }
 
 LaserCubeNetLifecycleResult LaserCubeNetController::darkSequenceLocked(
@@ -968,7 +1172,7 @@ libera::expected<LaserCubeNetStatus> LaserCubeNetController::requestFreshStatus(
                                  : std::errc::timed_out));
 }
 
-void LaserCubeNetController::checkAcksLocked() {
+void LaserCubeNetController::checkAcksLocked(const bool retireStaleSlots) {
     if (!dataSocket) {
         return;
     }
@@ -1024,7 +1228,10 @@ void LaserCubeNetController::checkAcksLocked() {
         const std::uint8_t receivedMessageNumber = buffer[1];
         const auto& sentTime = messageTimes[receivedMessageNumber];
         if (sentTime == std::chrono::steady_clock::time_point{}) {
-            recordIntermittentError(error_types::network::packetLoss);
+            // A valid peer can deliver a duplicate ACK, or an ACK for a packet
+            // retired when a lifecycle transition cleared the tracking ring.
+            // With no pending send in this slot there is no loss to report and
+            // this ACK must not satisfy any current-generation delivery gate.
             continue;
         }
 
@@ -1056,16 +1263,19 @@ void LaserCubeNetController::checkAcksLocked() {
         }
 
         messageTimes[receivedMessageNumber] = std::chrono::steady_clock::time_point{};
+        ++acknowledgedMessageCount;
         if (pendingAckCount > 0) --pendingAckCount;
     }
 
     if (pendingAckCount > 0) {
         // Clean up entries that have been pending for more than 1 second.
-        for (auto& slot : messageTimes) {
-            if (slot == std::chrono::steady_clock::time_point{}) continue;
-            if ((now - slot) > std::chrono::seconds(1)) {
-                slot = std::chrono::steady_clock::time_point{};
-                if (pendingAckCount > 0) --pendingAckCount;
+        if (retireStaleSlots) {
+            for (auto& slot : messageTimes) {
+                if (slot == std::chrono::steady_clock::time_point{}) continue;
+                if ((now - slot) > std::chrono::seconds(1)) {
+                    slot = std::chrono::steady_clock::time_point{};
+                    if (pendingAckCount > 0) --pendingAckCount;
+                }
             }
         }
 

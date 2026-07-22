@@ -33,6 +33,8 @@ struct LaserCubeNetStatus {
     std::string modelName;
 
     std::chrono::steady_clock::time_point lastSeen{};
+    // Non-zero only for a controller-owned direct query receive epoch.
+    std::chrono::steady_clock::time_point probeEpochStartedAt{};
 
     bool isPluggedIn() const noexcept {
         return batteryPercent == 255;

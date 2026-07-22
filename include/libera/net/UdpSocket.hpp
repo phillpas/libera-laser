@@ -144,11 +144,16 @@ public:
     }
 
     udp::socket& raw() { return sock; }
+    // Wake in-flight operations without releasing the bound receive epoch.
+    // A replacement can bind first and retire this socket without port reuse.
+    void interrupt() noexcept {
+        closeRequested.store(true, std::memory_order_release);
+        retryChanged.notify_all();
+    }
     void close() noexcept {
         // Signalling does not need the socket lock, so a blocked receive wakes
         // before close waits to serialize access to the Asio socket object.
-        closeRequested.store(true, std::memory_order_release);
-        retryChanged.notify_all();
+        interrupt();
 
         std::lock_guard<std::mutex> lock(socketMutex);
         std::error_code ignored;
