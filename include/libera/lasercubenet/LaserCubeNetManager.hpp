@@ -25,7 +25,7 @@ class LaserCubeNetManager
     : public core::ControllerManagerBase<LaserCubeNetControllerInfo,
                                          LaserCubeNetController> {
 public:
-    LaserCubeNetManager();
+    explicit LaserCubeNetManager(LaserCubeNetNetworkConfig networkConfig = {});
     ~LaserCubeNetManager() override;
 
     std::vector<std::unique_ptr<core::ControllerInfo>> discover() override;
@@ -50,6 +50,7 @@ private:
 
     std::mutex controllersMutex;
     std::unordered_map<std::string, ControllerEntry> controllers;
+    LaserCubeNetNetworkConfig networkConfig;
 
     ControllerPtr createController(const LaserCubeNetControllerInfo& info) override;
     NewControllerDisposition prepareNewController(LaserCubeNetController& controller,

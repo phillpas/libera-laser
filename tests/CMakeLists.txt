@@ -19,6 +19,7 @@ set(LIBERA_UNIT_TESTS
 if(LIBERA_ENABLE_LASERCUBENET)
   list(APPEND LIBERA_UNIT_TESTS
     test_lasercubenet_buffer_target.cpp
+    test_lasercubenet_lifecycle.cpp
     test_lasercubenet_point_rate.cpp
     test_lasercubenet_registration.cpp
     test_lasercubenet_status.cpp)

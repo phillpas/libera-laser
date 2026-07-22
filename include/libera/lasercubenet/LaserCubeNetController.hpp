@@ -20,8 +20,9 @@ namespace libera::lasercubenet {
 
 class LaserCubeNetController : public core::LaserController {
 public:
-    LaserCubeNetController();
-    explicit LaserCubeNetController(LaserCubeNetControllerInfo info);
+    explicit LaserCubeNetController(LaserCubeNetNetworkConfig networkConfig = {});
+    LaserCubeNetController(LaserCubeNetControllerInfo info,
+                           LaserCubeNetNetworkConfig networkConfig = {});
     ~LaserCubeNetController() override;
 
     libera::expected<void> connect(const LaserCubeNetControllerInfo& info);
@@ -56,6 +57,7 @@ private:
     net::udp::endpoint commandEndpoint;
 
     std::string ipAddress;
+    LaserCubeNetNetworkConfig networkConfig;
 
     std::atomic<int> pointBufferCapacity{1000};
     std::atomic<std::uint32_t> maxPointRate{60000};

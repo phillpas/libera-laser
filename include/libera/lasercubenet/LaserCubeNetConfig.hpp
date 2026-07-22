@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace libera::lasercubenet {
 
@@ -41,6 +43,20 @@ struct LaserCubeNetConfig {
             static_cast<int>(MAX_POINTS_PER_PACKET),
             static_cast<int>(SAFETY_HEADROOM_POINTS));
     }
+};
+
+// Injectable network endpoints and deadlines for deterministic loopback tests.
+// Defaults preserve the production LaserCubeNet broadcast behavior.
+struct LaserCubeNetNetworkConfig {
+    std::vector<std::string> discoveryDestinations{"255.255.255.255"};
+    std::string localBindAddress{"0.0.0.0"};
+    std::uint16_t discoveryBindPort = LaserCubeNetConfig::COMMAND_PORT;
+    std::uint16_t commandPort = LaserCubeNetConfig::COMMAND_PORT;
+    std::uint16_t dataPort = LaserCubeNetConfig::DATA_PORT;
+    std::chrono::milliseconds sendTimeout{200};
+    std::chrono::milliseconds receivePollTimeout{50};
+    std::chrono::milliseconds discoveryWindow{1000};
+    std::chrono::milliseconds discoveryInterval{250};
 };
 
 } // namespace libera::lasercubenet

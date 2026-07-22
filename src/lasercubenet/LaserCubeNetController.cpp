@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 #include <thread>
+#include <utility>
 
 namespace libera::lasercubenet {
 
@@ -17,13 +18,16 @@ namespace error_types = libera::core::error_types;
 constexpr auto ackDisconnectThreshold = std::chrono::milliseconds(500);
 constexpr auto reconnectRetryDelay = std::chrono::milliseconds(100);
 
-LaserCubeNetController::LaserCubeNetController() {
+LaserCubeNetController::LaserCubeNetController(LaserCubeNetNetworkConfig networkConfigValue)
+    : networkConfig(std::move(networkConfigValue)) {
     // Reuse the shared IO context so sockets share the same network thread.
     io = net::shared_io_context();
 }
 
-LaserCubeNetController::LaserCubeNetController(LaserCubeNetControllerInfo info)
-    : LaserCubeNetController() {
+LaserCubeNetController::LaserCubeNetController(
+    LaserCubeNetControllerInfo info,
+    LaserCubeNetNetworkConfig networkConfigValue)
+    : LaserCubeNetController(std::move(networkConfigValue)) {
     ipAddress = info.ipAddress();
 }
 
@@ -97,7 +101,14 @@ libera::expected<void> LaserCubeNetController::connectToStatus(const LaserCubeNe
         recordConnectionError(error_types::network::connectFailed);
         return libera::unexpected(ec);
     }
-    if (auto ec = dataSocket->bind_any(0)) {
+    std::error_code bindAddressError;
+    const auto bindAddress = libera::net::asio::ip::make_address(
+        networkConfig.localBindAddress, bindAddressError);
+    if (bindAddressError) {
+        recordConnectionError(error_types::network::connectFailed);
+        return libera::unexpected(bindAddressError);
+    }
+    if (auto ec = dataSocket->bind(bindAddress, 0)) {
         recordConnectionError(error_types::network::connectFailed);
         return libera::unexpected(ec);
     }
@@ -105,7 +116,7 @@ libera::expected<void> LaserCubeNetController::connectToStatus(const LaserCubeNe
         recordConnectionError(error_types::network::connectFailed);
         return libera::unexpected(ec);
     }
-    if (auto ec = commandSocket->bind_any(0)) {
+    if (auto ec = commandSocket->bind(bindAddress, 0)) {
         recordConnectionError(error_types::network::connectFailed);
         return libera::unexpected(ec);
     }
@@ -117,8 +128,8 @@ libera::expected<void> LaserCubeNetController::connectToStatus(const LaserCubeNe
         return libera::unexpected(std::make_error_code(std::errc::invalid_argument));
     }
 
-    dataEndpoint = libera::net::asio::ip::udp::endpoint(address, LaserCubeNetConfig::DATA_PORT);
-    commandEndpoint = libera::net::asio::ip::udp::endpoint(address, LaserCubeNetConfig::COMMAND_PORT);
+    dataEndpoint = libera::net::asio::ip::udp::endpoint(address, networkConfig.dataPort);
+    commandEndpoint = libera::net::asio::ip::udp::endpoint(address, networkConfig.commandPort);
 
     networkConnected.store(true, std::memory_order_relaxed);
     reconnectRequested.store(false, std::memory_order_relaxed);
@@ -380,7 +391,8 @@ bool LaserCubeNetController::sendCommand(std::uint8_t cmd, const std::uint8_t* p
         buffer.appendUInt8(payload ? payload[i] : 0);
     }
 
-    auto ec = commandSocket->send_to(buffer.data(), buffer.size(), commandEndpoint, std::chrono::milliseconds(200));
+    auto ec = commandSocket->send_to(
+        buffer.data(), buffer.size(), commandEndpoint, networkConfig.sendTimeout);
     if (ec) {
         logError("[LaserCubeNetController] command send failed", ec.message());
         recordConnectionError(error_types::network::sendFailed);
