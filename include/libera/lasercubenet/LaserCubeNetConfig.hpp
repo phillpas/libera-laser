@@ -68,6 +68,36 @@ struct LaserCubeNetNetworkConfig {
     std::chrono::milliseconds discoveryWindow{1000};
     std::chrono::milliseconds discoveryInterval{250};
 
+    // A discovery response must come from the configured command port. For
+    // injected unicast destinations, its source address must also be one of
+    // those destinations. The production limited-broadcast destination is the
+    // deliberate exception because any controller on the local IPv4 segment
+    // may answer it.
+    [[nodiscard]] bool acceptsDiscoveryResponse(
+        const std::string& sourceAddress,
+        std::uint16_t sourcePort) const {
+        if (sourcePort != commandPort) {
+            return false;
+        }
+
+        std::error_code addressError;
+        const auto source = net::asio::ip::make_address(sourceAddress, addressError);
+        if (addressError || !source.is_v4()) {
+            return false;
+        }
+        for (const auto& destination : discoveryDestinations) {
+            addressError.clear();
+            const auto expected = net::asio::ip::make_address(destination, addressError);
+            if (addressError || !expected.is_v4()) {
+                continue;
+            }
+            if (expected.to_v4().to_uint() == 0xffffffffU || expected == source) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     [[nodiscard]] std::error_code validate() const {
         if (discoveryDestinations.empty() ||
             discoveryDestinations.size() > MAX_DISCOVERY_DESTINATIONS ||

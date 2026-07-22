@@ -90,6 +90,13 @@ void LaserCubeNetManager::discoveryThread() {
                 continue;
             }
 
+            if (!networkConfig.acceptsDiscoveryResponse(
+                    sender.address().to_string(), sender.port())) {
+                logInfo("[LaserCubeNetManager] ignored discovery response from unexpected sender",
+                        sender.address().to_string(), sender.port());
+                continue;
+            }
+
             // Parse and stash the most recent status for each controller.
             if (auto status = LaserCubeNetStatus::parse(buffer.data(), received)) {
                 status->ipAddress = sender.address().to_string();

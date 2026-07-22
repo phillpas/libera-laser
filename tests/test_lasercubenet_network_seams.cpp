@@ -192,6 +192,20 @@ void productionDefaultsHaveExactParity() {
     CHECK(!config.validate());
 }
 
+void discoveryResponseSenderValidationIsExact() {
+    auto config = twoCubeNetwork();
+    CHECK(config.acceptsDiscoveryResponse("127.0.0.1", LaserCubeNetConfig::COMMAND_PORT));
+    CHECK(config.acceptsDiscoveryResponse("127.0.0.2", LaserCubeNetConfig::COMMAND_PORT));
+    CHECK(!config.acceptsDiscoveryResponse("127.0.0.4", LaserCubeNetConfig::COMMAND_PORT));
+    CHECK(!config.acceptsDiscoveryResponse("127.0.0.1", LaserCubeNetConfig::COMMAND_PORT + 1));
+    CHECK(!config.acceptsDiscoveryResponse("not-an-address", LaserCubeNetConfig::COMMAND_PORT));
+
+    const LaserCubeNetNetworkConfig production;
+    CHECK(production.acceptsDiscoveryResponse("192.0.2.10", LaserCubeNetConfig::COMMAND_PORT));
+    CHECK(!production.acceptsDiscoveryResponse("192.0.2.10",
+                                               LaserCubeNetConfig::COMMAND_PORT + 1));
+}
+
 void rejectsInvalidConfiguration() {
     auto expectInvalid = [](LaserCubeNetNetworkConfig config) {
         CHECK(config.validate() == std::make_error_code(std::errc::invalid_argument));
@@ -402,6 +416,7 @@ int main(int argc, char** argv) {
     }
 
     productionDefaultsHaveExactParity();
+    discoveryResponseSenderValidationIsExact();
     rejectsInvalidConfiguration();
     reportsBindFailureWithoutStartingDiscovery();
     deadlineDoesNotDependOnStoppedExecutor();
