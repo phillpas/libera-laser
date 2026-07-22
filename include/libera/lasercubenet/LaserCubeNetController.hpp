@@ -15,8 +15,33 @@
 #include <string>
 #include <chrono>
 #include <optional>
+#include <functional>
 
 namespace libera::lasercubenet {
+
+struct LaserCubeNetOperation {
+    std::chrono::steady_clock::time_point deadline;
+    std::function<bool()> cancelled;
+
+    static LaserCubeNetOperation withTimeout(std::chrono::milliseconds timeout) {
+        return LaserCubeNetOperation{
+            std::chrono::steady_clock::now() + timeout,
+            [] { return false; }};
+    }
+};
+
+enum class LaserCubeNetRemoteEvidence {
+    HostDarkRequested,
+    DeviceReportedDisabled,
+    HostEnableRequested,
+    DeviceReportedEnabled
+};
+
+struct LaserCubeNetLifecycleReport {
+    LaserCubeNetRemoteEvidence evidence = LaserCubeNetRemoteEvidence::HostDarkRequested;
+    LaserCubeNetStatus status;
+    bool bufferConfirmedEmpty = false;
+};
 
 class LaserCubeNetController : public core::LaserController {
 public:
@@ -26,6 +51,15 @@ public:
     ~LaserCubeNetController() override;
 
     libera::expected<void> connect(const LaserCubeNetControllerInfo& info);
+    libera::expected<LaserCubeNetLifecycleReport> connectDark(
+        const LaserCubeNetControllerInfo& info,
+        const LaserCubeNetOperation& operation);
+    libera::expected<LaserCubeNetLifecycleReport> enableOutput(
+        const LaserCubeNetOperation& operation);
+    libera::expected<LaserCubeNetLifecycleReport> disableDark(
+        const LaserCubeNetOperation& operation);
+    libera::expected<LaserCubeNetLifecycleReport> shutdownDark(
+        const LaserCubeNetOperation& operation);
     void close();
     std::optional<core::BufferState> getBufferState() const override;
     void updateDiscoveredStatus(const LaserCubeNetStatus& status);
@@ -46,6 +80,11 @@ private:
     bool sendPoints();
     bool sendData(const std::uint8_t* buffer, std::size_t size);
     bool sendCommand(std::uint8_t cmd, const std::uint8_t* payload, std::size_t size);
+    bool sendCommandLocked(std::uint8_t cmd, const std::uint8_t* payload, std::size_t size);
+    libera::expected<LaserCubeNetStatus> requestFreshStatus(
+        const LaserCubeNetOperation& operation,
+        std::chrono::steady_clock::time_point newerThan);
+    bool operationStopped(const LaserCubeNetOperation& operation) const;
     void checkAcks();
 
     int getTotalBufferCapacity() const;
@@ -58,6 +97,7 @@ private:
 
     std::string ipAddress;
     LaserCubeNetNetworkConfig networkConfig;
+    std::mutex lifecycleMutex;
 
     std::atomic<int> pointBufferCapacity{1000};
     std::atomic<std::uint32_t> maxPointRate{60000};

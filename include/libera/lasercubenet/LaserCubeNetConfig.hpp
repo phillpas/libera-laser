@@ -19,6 +19,10 @@ struct LaserCubeNetConfig {
     static constexpr std::uint8_t CMD_SET_OUTPUT = 0x80;
     static constexpr std::uint8_t CMD_SET_ILDA_RATE = 0x82;
     static constexpr std::uint8_t CMD_GET_RINGBUFFER_FREE = 0x8a;
+    // Independently observed LaserCube network command. This constant was not
+    // present in the original Libera baseline and must remain tracked by
+    // downstream protocol-provenance records until hardware verification.
+    static constexpr std::uint8_t CMD_CLEAR_RINGBUFFER = 0x8d;
     static constexpr std::uint8_t CMD_SAMPLE_DATA = 0xa9;
 
     static constexpr std::size_t MAX_POINTS_PER_PACKET = 140; // fits within MTU
@@ -45,8 +49,6 @@ struct LaserCubeNetConfig {
     }
 };
 
-// Injectable network endpoints and deadlines for deterministic loopback tests.
-// Defaults preserve the production LaserCubeNet broadcast behavior.
 struct LaserCubeNetNetworkConfig {
     std::vector<std::string> discoveryDestinations{"255.255.255.255"};
     std::string localBindAddress{"0.0.0.0"};
