@@ -5,16 +5,22 @@
 
 #include <array>
 #include <exception>
+#include <utility>
 
 namespace libera::lasercubenet {
 
-LaserCubeNetManager::LaserCubeNetManager() {
+LaserCubeNetManager::LaserCubeNetManager(LaserCubeNetNetworkConfig networkConfigValue)
+    : networkConfig(std::move(networkConfigValue)) {
     io = net::shared_io_context();
     socket = std::make_unique<net::UdpSocket>(*io);
     if (!socket->open_v4()) {
         socket->enable_broadcast(true);
-        // Bind to the command port so we can receive status replies.
-        socket->bind_any(LaserCubeNetConfig::COMMAND_PORT);
+        std::error_code addressError;
+        const auto bindAddress = asio::ip::make_address(
+            networkConfig.localBindAddress, addressError);
+        if (!addressError) {
+            socket->bind(bindAddress, networkConfig.discoveryBindPort);
+        }
     }
     running.store(true);
     listenerFinished.store(false, std::memory_order_relaxed);
@@ -49,11 +55,11 @@ void LaserCubeNetManager::discoveryThread() {
         sendProbe();
 
         const auto windowStart = Clock::now();
-        while (running.load() && Clock::now() - windowStart < std::chrono::seconds(1)) {
+        while (running.load() && Clock::now() - windowStart < networkConfig.discoveryWindow) {
             asio::ip::udp::endpoint sender;
             std::size_t received = 0;
             auto ec = socket->recv_from(buffer.data(), buffer.size(), sender, received,
-                                        std::chrono::milliseconds(500), false);
+                                        networkConfig.receivePollTimeout, false);
             if (ec) {
                 if (ec == asio::error::operation_aborted || !running.load()) {
                     break;
@@ -112,7 +118,7 @@ void LaserCubeNetManager::discoveryThread() {
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        std::this_thread::sleep_for(networkConfig.discoveryInterval);
     }
 }
 
@@ -120,8 +126,15 @@ void LaserCubeNetManager::sendProbe() {
     if (!socket) return;
     // One-byte command broadcast; controllers reply with a 64-byte status payload.
     const std::uint8_t cmd = LaserCubeNetConfig::CMD_GET_FULL_INFO;
-    asio::ip::udp::endpoint broadcastEndpoint(asio::ip::address_v4::broadcast(), LaserCubeNetConfig::COMMAND_PORT);
-    socket->send_to(&cmd, 1, broadcastEndpoint, std::chrono::milliseconds(200));
+    for (const auto& destination : networkConfig.discoveryDestinations) {
+        std::error_code addressError;
+        const auto address = asio::ip::make_address(destination, addressError);
+        if (addressError) {
+            continue;
+        }
+        asio::ip::udp::endpoint endpoint(address, networkConfig.commandPort);
+        socket->send_to(&cmd, 1, endpoint, networkConfig.sendTimeout);
+    }
 }
 
 std::vector<std::unique_ptr<core::ControllerInfo>> LaserCubeNetManager::discover() {
@@ -136,7 +149,7 @@ std::vector<std::unique_ptr<core::ControllerInfo>> LaserCubeNetManager::discover
 
 std::shared_ptr<LaserCubeNetController>
 LaserCubeNetManager::createController(const LaserCubeNetControllerInfo& info) {
-    return std::make_shared<LaserCubeNetController>(info);
+    return std::make_shared<LaserCubeNetController>(info, networkConfig);
 }
 
 LaserCubeNetManager::NewControllerDisposition
@@ -144,9 +157,12 @@ LaserCubeNetManager::prepareNewController(LaserCubeNetController& controller,
                                           const LaserCubeNetControllerInfo& info) {
     controller.updateDiscoveredStatus(info.status());
 
-    // Connect and start the controller thread on first acquisition.
-    if (auto result = controller.connect(info); !result) {
+    // A failed dark handshake is never cached. A later retry constructs a
+    // fresh locally disarmed controller instance.
+    const auto operation = LaserCubeNetOperation::withTimeout(std::chrono::milliseconds(750));
+    if (auto result = controller.connectDark(info, operation); !result) {
         logError("[LaserCubeNetManager] initial connect failed", result.error().message());
+        return NewControllerDisposition::DropController;
     }
     controller.startThread();
     return NewControllerDisposition::KeepController;
@@ -174,7 +190,10 @@ void LaserCubeNetManager::afterCloseControllers() {
 void LaserCubeNetManager::closeController(const std::string& key,
                                           LaserCubeNetController& controller) {
     (void)key;
-    controller.close();
+    const auto operation = LaserCubeNetOperation::withTimeout(std::chrono::milliseconds(750));
+    if (auto result = controller.shutdownDark(operation); !result) {
+        logError("[LaserCubeNetManager] shutdown-dark failed", result.error().message());
+    }
 }
 
 } // namespace libera::lasercubenet

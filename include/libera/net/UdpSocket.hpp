@@ -1,6 +1,8 @@
 #pragma once
 #include "libera/net/NetConfig.hpp"
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include "libera/net/Deadline.hpp"
 
 namespace libera::net {
@@ -33,6 +35,17 @@ public:
         sock.bind(udp::endpoint(udp::v4(), port), ec);
         if (ec && logFailure) {
             logError("[UdpSocket] bind_any failed on port", port, ec.message());
+        }
+        return ec;
+    }
+
+    std::error_code bind(const asio::ip::address& address,
+                         uint16_t port,
+                         bool logFailure = true) {
+        std::error_code ec;
+        sock.bind(udp::endpoint(address, port), ec);
+        if (ec && logFailure) {
+            logError("[UdpSocket] bind failed", address.to_string(), port, ec.message());
         }
         return ec;
     }
@@ -82,7 +95,37 @@ public:
     }
 
     udp::socket& raw() { return sock; }
-    void close() { std::error_code ignore; sock.close(ignore); }
+    void close() {
+        struct CloseState {
+            std::mutex mutex;
+            std::condition_variable cv;
+            bool done = false;
+        };
+
+        auto state = std::make_shared<CloseState>();
+        auto closeOnExecutor = [this, state] {
+            std::error_code ignored;
+            sock.cancel(ignored);
+            sock.close(ignored);
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->done = true;
+            }
+            state->cv.notify_one();
+        };
+
+        try {
+            // dispatch executes inline when close() is called by the I/O thread
+            // and queues otherwise. Either way, socket cancellation/close is
+            // serialized with async initiation and completion.
+            asio::dispatch(sock.get_executor(), std::move(closeOnExecutor));
+        } catch (...) {
+            return;
+        }
+
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->cv.wait(lock, [&] { return state->done; });
+    }
 
 private:
     void cancelNoThrow() { std::error_code ignore; sock.cancel(ignore); }
