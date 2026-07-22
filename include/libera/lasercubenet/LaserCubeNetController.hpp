@@ -16,6 +16,8 @@
 #include <chrono>
 #include <optional>
 #include <functional>
+#include <system_error>
+#include <utility>
 
 namespace libera::lasercubenet {
 
@@ -31,6 +33,7 @@ struct LaserCubeNetOperation {
 };
 
 enum class LaserCubeNetRemoteEvidence {
+    None,
     HostDarkRequested,
     DeviceReportedDisabled,
     HostEnableRequested,
@@ -38,9 +41,45 @@ enum class LaserCubeNetRemoteEvidence {
 };
 
 struct LaserCubeNetLifecycleReport {
-    LaserCubeNetRemoteEvidence evidence = LaserCubeNetRemoteEvidence::HostDarkRequested;
+    LaserCubeNetRemoteEvidence evidence = LaserCubeNetRemoteEvidence::None;
     LaserCubeNetStatus status;
+    bool hasFreshStatus = false;
+    bool bufferCapacitySupported = false;
     bool bufferConfirmedEmpty = false;
+};
+
+// A lifecycle failure still carries the strongest evidence obtained before the
+// error. This deliberately mirrors the small expected<T> surface used by
+// existing callers while preserving HostDarkRequested/HostEnableRequested.
+class LaserCubeNetLifecycleResult {
+public:
+    static LaserCubeNetLifecycleResult success(LaserCubeNetLifecycleReport report) {
+        return LaserCubeNetLifecycleResult(std::move(report), {});
+    }
+
+    static LaserCubeNetLifecycleResult failure(
+        std::error_code error,
+        LaserCubeNetLifecycleReport report = {}) {
+        return LaserCubeNetLifecycleResult(std::move(report), error);
+    }
+
+    explicit operator bool() const noexcept { return !errorValue; }
+    const std::error_code& error() const noexcept { return errorValue; }
+    LaserCubeNetLifecycleReport& value() { return reportValue; }
+    const LaserCubeNetLifecycleReport& value() const { return reportValue; }
+    LaserCubeNetLifecycleReport& operator*() { return reportValue; }
+    const LaserCubeNetLifecycleReport& operator*() const { return reportValue; }
+    LaserCubeNetLifecycleReport* operator->() { return &reportValue; }
+    const LaserCubeNetLifecycleReport* operator->() const { return &reportValue; }
+
+private:
+    LaserCubeNetLifecycleResult(
+        LaserCubeNetLifecycleReport report,
+        std::error_code error)
+        : reportValue(std::move(report)), errorValue(error) {}
+
+    LaserCubeNetLifecycleReport reportValue;
+    std::error_code errorValue;
 };
 
 class LaserCubeNetController : public core::LaserController {
@@ -51,15 +90,16 @@ public:
     ~LaserCubeNetController() override;
 
     libera::expected<void> connect(const LaserCubeNetControllerInfo& info);
-    libera::expected<LaserCubeNetLifecycleReport> connectDark(
+    LaserCubeNetLifecycleResult connectDark(
         const LaserCubeNetControllerInfo& info,
         const LaserCubeNetOperation& operation);
-    libera::expected<LaserCubeNetLifecycleReport> enableOutput(
+    LaserCubeNetLifecycleResult enableOutput(
         const LaserCubeNetOperation& operation);
-    libera::expected<LaserCubeNetLifecycleReport> disableDark(
+    LaserCubeNetLifecycleResult disableDark(
         const LaserCubeNetOperation& operation);
-    libera::expected<LaserCubeNetLifecycleReport> shutdownDark(
+    LaserCubeNetLifecycleResult shutdownDark(
         const LaserCubeNetOperation& operation);
+    LaserCubeNetLifecycleReport getLastLifecycleReport() const;
     void close();
     std::optional<core::BufferState> getBufferState() const override;
     void updateDiscoveredStatus(const LaserCubeNetStatus& status);
@@ -76,16 +116,32 @@ private:
     /// Push the desired point rate to the device if it differs from the
     /// last-sent value, or if a forced re-push is pending after reconnect.
     void syncPointRate();
+    void syncPointRateLocked();
 
     bool sendPoints();
-    bool sendData(const std::uint8_t* buffer, std::size_t size);
+    bool sendDataLocked(const std::uint8_t* buffer, std::size_t size);
     bool sendCommand(std::uint8_t cmd, const std::uint8_t* payload, std::size_t size);
     bool sendCommandLocked(std::uint8_t cmd, const std::uint8_t* payload, std::size_t size);
+    bool rotateCommandSocketLocked();
+    bool sendStartupBlankLocked(std::size_t packetCount = 2);
+    bool confirmStartupDeliveryLocked(const LaserCubeNetOperation& operation);
+    bool drainCommandResponsesLocked(const LaserCubeNetOperation& operation);
     libera::expected<LaserCubeNetStatus> requestFreshStatus(
         const LaserCubeNetOperation& operation,
         std::chrono::steady_clock::time_point newerThan);
+    LaserCubeNetLifecycleResult darkSequenceLocked(
+        const LaserCubeNetOperation& operation,
+        bool configureTransport);
     bool operationStopped(const LaserCubeNetOperation& operation) const;
-    void checkAcks();
+    void clearOutputIntentLocked() noexcept;
+    std::uint64_t beginEnableIntentLocked() noexcept;
+    bool commitEnableIntentLocked(std::uint64_t expectedGeneration) noexcept;
+    void setLastLifecycleReport(const LaserCubeNetLifecycleReport& report);
+    void bestEffortOffLocked() noexcept;
+    bool lockLifecycle(
+        const LaserCubeNetOperation& operation,
+        std::unique_lock<std::timed_mutex>& lock);
+    void checkAcksLocked();
 
     int getTotalBufferCapacity() const;
 
@@ -97,7 +153,13 @@ private:
 
     std::string ipAddress;
     LaserCubeNetNetworkConfig networkConfig;
-    std::mutex lifecycleMutex;
+    mutable std::timed_mutex lifecycleMutex;
+    std::mutex outputIntentMutex;
+    mutable std::mutex lifecycleReportMutex;
+    LaserCubeNetLifecycleReport lastLifecycleReport;
+    bool remoteEnabledConfirmed = false;
+    std::atomic<bool> streamingAllowed{false};
+    std::atomic<std::uint64_t> outputGeneration{0};
 
     std::atomic<int> pointBufferCapacity{1000};
     std::atomic<std::uint32_t> maxPointRate{60000};

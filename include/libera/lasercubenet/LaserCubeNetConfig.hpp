@@ -21,9 +21,9 @@ struct LaserCubeNetConfig {
     static constexpr std::uint8_t CMD_SET_OUTPUT = 0x80;
     static constexpr std::uint8_t CMD_SET_ILDA_RATE = 0x82;
     static constexpr std::uint8_t CMD_GET_RINGBUFFER_FREE = 0x8a;
-    // Independently observed LaserCube network command. This constant was not
-    // present in the original Libera baseline and must remain tracked by
-    // downstream protocol-provenance records until hardware verification.
+    // This command was absent from the audited Libera baseline. Its value and
+    // zero-payload shape remain synthetic/unverified in downstream provenance
+    // until the separately authorized hardware verification accepts them.
     static constexpr std::uint8_t CMD_CLEAR_RINGBUFFER = 0x8d;
     static constexpr std::uint8_t CMD_SAMPLE_DATA = 0xa9;
 

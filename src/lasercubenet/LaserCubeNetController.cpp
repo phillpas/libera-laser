@@ -60,105 +60,202 @@ std::optional<LaserCubeNetStatus> LaserCubeNetController::getLatestStatus() cons
 }
 
 libera::expected<void> LaserCubeNetController::connect(const LaserCubeNetControllerInfo& info) {
-    const auto result = connectDark(info, LaserCubeNetOperation::withTimeout(std::chrono::milliseconds(750)));
+    const auto result = connectDark(
+        info, LaserCubeNetOperation::withTimeout(std::chrono::milliseconds(750)));
     if (!result) {
         return libera::unexpected(result.error());
     }
     return {};
 }
 
-libera::expected<LaserCubeNetLifecycleReport> LaserCubeNetController::connectDark(
+LaserCubeNetLifecycleResult LaserCubeNetController::connectDark(
     const LaserCubeNetControllerInfo& info,
     const LaserCubeNetOperation& operation) {
-    setArmed(false);
+    std::unique_lock<std::timed_mutex> lock(lifecycleMutex, std::defer_lock);
+    if (!lockLifecycle(operation, lock)) {
+        return LaserCubeNetLifecycleResult::failure(
+            std::make_error_code(operation.cancelled && operation.cancelled()
+                                     ? std::errc::operation_canceled
+                                     : std::errc::timed_out));
+    }
+
+    clearOutputIntentLocked();
     clearContentSource();
     updateDiscoveredStatus(info.status());
-    if (operationStopped(operation)) {
-        return libera::unexpected(std::make_error_code(std::errc::operation_canceled));
-    }
     if (auto connected = connectToStatus(info.status()); !connected) {
-        return libera::unexpected(connected.error());
+        clearOutputIntentLocked();
+        return LaserCubeNetLifecycleResult::failure(connected.error());
     }
-    auto dark = disableDark(operation);
+
+    auto dark = darkSequenceLocked(operation, true);
     if (!dark) {
+        clearOutputIntentLocked();
+        lock.unlock();
         close();
-        return libera::unexpected(dark.error());
+        return dark;
     }
     return dark;
 }
 
-libera::expected<LaserCubeNetLifecycleReport> LaserCubeNetController::enableOutput(
+LaserCubeNetLifecycleResult LaserCubeNetController::enableOutput(
     const LaserCubeNetOperation& operation) {
-    std::lock_guard<std::mutex> lock(lifecycleMutex);
-    if (operationStopped(operation)) {
-        return libera::unexpected(std::make_error_code(std::errc::operation_canceled));
+    std::unique_lock<std::timed_mutex> lock(lifecycleMutex, std::defer_lock);
+    if (!lockLifecycle(operation, lock)) {
+        return LaserCubeNetLifecycleResult::failure(
+            std::make_error_code(operation.cancelled && operation.cancelled()
+                                     ? std::errc::operation_canceled
+                                     : std::errc::timed_out));
+    }
+    if (remoteEnabledConfirmed && isArmed()) {
+        return LaserCubeNetLifecycleResult::success(getLastLifecycleReport());
     }
     if (contentSource() == ContentSource::None) {
-        return libera::unexpected(std::make_error_code(std::errc::invalid_argument));
+        return LaserCubeNetLifecycleResult::failure(
+            std::make_error_code(std::errc::invalid_argument));
     }
 
-    // Keep local colour output disarmed while the remote device transitions on.
-    // The caller may release visible content only after this fresh status proof.
-    setArmed(false);
-    const std::uint8_t enabled = 1;
-    const auto requestTime = std::chrono::steady_clock::now();
-    if (!sendCommandLocked(LaserCubeNetConfig::CMD_SET_OUTPUT, &enabled, 1)) {
-        return libera::unexpected(std::make_error_code(std::errc::io_error));
+    const auto enableGeneration = beginEnableIntentLocked();
+    if (!networkConnected.load(std::memory_order_relaxed)) {
+        return LaserCubeNetLifecycleResult::failure(
+            std::make_error_code(std::errc::not_connected));
     }
+
+    // Push the configured rate and a real blank startup packet while output is
+    // still remotely off. The streaming worker is gated until on is confirmed.
+    if (!rotateCommandSocketLocked()) {
+        return LaserCubeNetLifecycleResult::failure(
+            std::make_error_code(std::errc::io_error));
+    }
+    const auto desiredRate = getPointRate();
+    core::ByteBuffer ratePayload;
+    ratePayload.appendUInt32(desiredRate);
+    if (!sendCommandLocked(
+            LaserCubeNetConfig::CMD_SET_ILDA_RATE,
+            ratePayload.data(), ratePayload.size()) ||
+        !sendStartupBlankLocked() ||
+        !confirmStartupDeliveryLocked(operation) ||
+        !drainCommandResponsesLocked(operation)) {
+        bestEffortOffLocked();
+        clearOutputIntentLocked();
+        return LaserCubeNetLifecycleResult::failure(
+            operationStopped(operation)
+                ? std::make_error_code(operation.cancelled && operation.cancelled()
+                                           ? std::errc::operation_canceled
+                                           : std::errc::timed_out)
+                : std::make_error_code(std::errc::io_error));
+    }
+    lastSentPointRate = desiredRate;
+    pointRatePushNeeded = false;
+
+    const std::uint8_t enabled = 1;
+    bool enableSuperseded = false;
+    bool enableSent = false;
+    {
+        // Serialize the final epoch check with disableDark's pre-disarm. If
+        // disable has already claimed priority, no output-on datagram is sent.
+        std::lock_guard<std::mutex> intentLock(outputIntentMutex);
+        enableSuperseded =
+            outputGeneration.load(std::memory_order_acquire) != enableGeneration;
+        if (!enableSuperseded) {
+            enableSent = sendCommandLocked(
+                LaserCubeNetConfig::CMD_SET_OUTPUT, &enabled, 1);
+        }
+    }
+    if (enableSuperseded) {
+        bestEffortOffLocked();
+        clearOutputIntentLocked();
+        LaserCubeNetLifecycleReport report;
+        setLastLifecycleReport(report);
+        return LaserCubeNetLifecycleResult::failure(
+            std::make_error_code(std::errc::operation_canceled), report);
+    }
+    if (!enableSent) {
+        clearOutputIntentLocked();
+        return LaserCubeNetLifecycleResult::failure(
+            std::make_error_code(std::errc::io_error));
+    }
+    LaserCubeNetLifecycleReport report;
+    report.evidence = LaserCubeNetRemoteEvidence::HostEnableRequested;
+    setLastLifecycleReport(report);
+
+    const auto requestTime = std::chrono::steady_clock::now();
     auto status = requestFreshStatus(operation, requestTime);
     if (!status) {
-        return libera::unexpected(status.error());
+        bestEffortOffLocked();
+        clearOutputIntentLocked();
+        setLastLifecycleReport(report);
+        return LaserCubeNetLifecycleResult::failure(status.error(), report);
     }
+    report.status = *status;
+    report.hasFreshStatus = true;
+    report.bufferCapacitySupported = status->bufferMax > 0;
+    report.bufferConfirmedEmpty =
+        report.bufferCapacitySupported && status->bufferFree == status->bufferMax;
     if (!status->outputEnabled) {
-        return libera::unexpected(std::make_error_code(std::errc::state_not_recoverable));
+        bestEffortOffLocked();
+        clearOutputIntentLocked();
+        setLastLifecycleReport(report);
+        return LaserCubeNetLifecycleResult::failure(
+            std::make_error_code(std::errc::state_not_recoverable), report);
     }
-    setArmed(true);
-    return LaserCubeNetLifecycleReport{
-        LaserCubeNetRemoteEvidence::DeviceReportedEnabled,
-        *status,
-        status->bufferFree == status->bufferMax};
+
+    if (!commitEnableIntentLocked(enableGeneration)) {
+        bestEffortOffLocked();
+        clearOutputIntentLocked();
+        setLastLifecycleReport(report);
+        return LaserCubeNetLifecycleResult::failure(
+            std::make_error_code(std::errc::operation_canceled), report);
+    }
+    report.evidence = LaserCubeNetRemoteEvidence::DeviceReportedEnabled;
+    setLastLifecycleReport(report);
+    return LaserCubeNetLifecycleResult::success(report);
 }
 
-libera::expected<LaserCubeNetLifecycleReport> LaserCubeNetController::disableDark(
+LaserCubeNetLifecycleResult LaserCubeNetController::disableDark(
     const LaserCubeNetOperation& operation) {
-    // Local disarm happens before waiting for the lifecycle mutex. The streaming
-    // thread can therefore produce only black samples while remote cleanup runs.
-    setArmed(false);
+    // Fail closed immediately. A worker packet that has not reached its locked
+    // send point observes the generation change and is discarded.
+    {
+        // This short critical section linearizes disable priority against the
+        // enable output-on send and final local re-arm commit.
+        std::lock_guard<std::mutex> intentLock(outputIntentMutex);
+        setArmed(false);
+        streamingAllowed.store(false, std::memory_order_release);
+        outputGeneration.fetch_add(1, std::memory_order_acq_rel);
+    }
     clearContentSource();
-    std::lock_guard<std::mutex> lock(lifecycleMutex);
-    if (operationStopped(operation)) {
-        return libera::unexpected(std::make_error_code(std::errc::operation_canceled));
-    }
 
-    const std::uint8_t disabled = 0;
-    if (!sendCommandLocked(LaserCubeNetConfig::CMD_SET_OUTPUT, &disabled, 1) ||
-        !sendCommandLocked(LaserCubeNetConfig::CMD_CLEAR_RINGBUFFER, nullptr, 0)) {
-        return libera::unexpected(std::make_error_code(std::errc::io_error));
+    std::unique_lock<std::timed_mutex> lock(lifecycleMutex, std::defer_lock);
+    if (!lockLifecycle(operation, lock)) {
+        LaserCubeNetLifecycleReport report;
+        report.evidence = LaserCubeNetRemoteEvidence::None;
+        return LaserCubeNetLifecycleResult::failure(
+            std::make_error_code(operation.cancelled && operation.cancelled()
+                                     ? std::errc::operation_canceled
+                                     : std::errc::timed_out),
+            report);
     }
-    const auto finalOffRequestTime = std::chrono::steady_clock::now();
-    if (!sendCommandLocked(LaserCubeNetConfig::CMD_SET_OUTPUT, &disabled, 1)) {
-        return libera::unexpected(std::make_error_code(std::errc::io_error));
-    }
-    auto status = requestFreshStatus(operation, finalOffRequestTime);
-    if (!status) {
-        return libera::unexpected(status.error());
-    }
-    const bool empty = status->bufferFree == status->bufferMax;
-    if (status->outputEnabled || !empty) {
-        return libera::unexpected(std::make_error_code(std::errc::state_not_recoverable));
-    }
-    return LaserCubeNetLifecycleReport{
-        LaserCubeNetRemoteEvidence::DeviceReportedDisabled,
-        *status,
-        true};
+    clearOutputIntentLocked();
+    return darkSequenceLocked(operation, false);
 }
 
-libera::expected<LaserCubeNetLifecycleReport> LaserCubeNetController::shutdownDark(
+LaserCubeNetLifecycleResult LaserCubeNetController::shutdownDark(
     const LaserCubeNetOperation& operation) {
-    stopThread();
     auto report = disableDark(operation);
+    stopThread();
     close();
     return report;
+}
+
+LaserCubeNetLifecycleReport LaserCubeNetController::getLastLifecycleReport() const {
+    std::lock_guard<std::mutex> lock(lifecycleReportMutex);
+    return lastLifecycleReport;
+}
+
+void LaserCubeNetController::setLastLifecycleReport(
+    const LaserCubeNetLifecycleReport& report) {
+    std::lock_guard<std::mutex> lock(lifecycleReportMutex);
+    lastLifecycleReport = report;
 }
 
 libera::expected<void> LaserCubeNetController::connectToStatus(const LaserCubeNetStatus& status) {
@@ -255,7 +352,11 @@ bool LaserCubeNetController::reconnectToLatestStatus() {
         return false;
     }
 
-    auto result = connectToStatus(*status);
+    // Recovery is a fresh dark connection. Previous armed/output intent is
+    // never restored as a side effect of discovery or transport recovery.
+    LaserCubeNetControllerInfo info(*status);
+    auto result = connectDark(
+        info, LaserCubeNetOperation::withTimeout(std::chrono::milliseconds(750)));
     if (!result) {
         logError("[LaserCubeNetController] reconnect failed", result.error().message());
         return false;
@@ -265,6 +366,9 @@ bool LaserCubeNetController::reconnectToLatestStatus() {
 }
 
 void LaserCubeNetController::close() {
+    std::lock_guard<std::timed_mutex> lock(lifecycleMutex);
+    clearOutputIntentLocked();
+    clearContentSource();
     networkConnected.store(false, std::memory_order_relaxed);
     reconnectRequested.store(false, std::memory_order_relaxed);
     setConnectionState(false);
@@ -296,15 +400,23 @@ void LaserCubeNetController::run() {
         setConnectionState(true);
         syncPointRate();
 
-        // Send at most one packet per loop; pacing is handled by buffer estimation.
-        (void)sendPoints();
-        checkAcks();
+        if (streamingAllowed.load(std::memory_order_acquire)) {
+            // Send at most one packet per loop; lifecycle generation checks
+            // discard work that was prepared before a concurrent disable.
+            (void)sendPoints();
+            std::lock_guard<std::timed_mutex> lock(lifecycleMutex);
+            checkAcksLocked();
+        }
 
         // Adaptive sleep: wait roughly as long as the buffer excess takes to drain.
         // This avoids a busy loop when the controller doesn't need more data yet.
         {
             const int bufferFullness = lastEstimatedBufferFullness.load(std::memory_order_relaxed);
-            const auto activePointRate = lastSentPointRate;
+            std::uint32_t activePointRate = 0;
+            {
+                std::lock_guard<std::timed_mutex> lock(lifecycleMutex);
+                activePointRate = lastSentPointRate;
+            }
             const int targetFull = LaserCubeNetConfig::targetBufferPoints(
                 activePointRate, getTotalBufferCapacity(), targetLatency());
             const int excess = bufferFullness - targetFull;
@@ -333,22 +445,30 @@ void LaserCubeNetController::setPointRate(std::uint32_t pointRateValue) {
 }
 
 bool LaserCubeNetController::sendPoints() {
-    // Advance a notional frame index to mirror the LaserDockNet protocol.
-    frameNumber++;
-
-    const auto activePointRate = lastSentPointRate;
+    const auto generationAtRequest = outputGeneration.load(std::memory_order_acquire);
+    std::uint32_t activePointRate = 0;
+    int sentBufferSizeSnapshot = 0;
+    std::chrono::steady_clock::time_point dataSentTimeSnapshot{};
+    std::chrono::steady_clock::time_point ackTimeSnapshot{};
+    {
+        std::lock_guard<std::timed_mutex> lock(lifecycleMutex);
+        activePointRate = lastSentPointRate;
+        sentBufferSizeSnapshot = lastDataSentBufferSize;
+        dataSentTimeSnapshot = lastDataSentTime;
+        ackTimeSnapshot = lastAckTime;
+    }
 
     // Estimate how full the controller buffer is right now.
     const int minEstimatedBufferFullness =
         std::max(
             calculateBufferFullnessFromSnapshot(
-                lastDataSentBufferSize,
-                lastDataSentTime,
+                sentBufferSizeSnapshot,
+                dataSentTimeSnapshot,
                 activePointRate,
                 0),
             calculateBufferFullnessFromSnapshot(
                 lastReportedBufferFullness.load(std::memory_order_relaxed),
-                lastAckTime,
+                ackTimeSnapshot,
                 activePointRate,
                 0));
     lastEstimatedBufferFullness.store(minEstimatedBufferFullness, std::memory_order_relaxed);
@@ -414,15 +534,21 @@ bool LaserCubeNetController::sendPoints() {
     //  4..: Point data, each point is 10 bytes:
     //       x[0], x[1], y[0], y[1], r[0], r[1], g[0], g[1], b[0], b[1]
     //       All channels are unsigned 12-bit values stored little-endian in 16-bit slots.
+    std::lock_guard<std::timed_mutex> lock(lifecycleMutex);
+    if (!streamingAllowed.load(std::memory_order_acquire) ||
+        !isArmed() ||
+        generationAtRequest != outputGeneration.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    // Message/frame counters and their acknowledgement slots are owned by the
+    // lifecycle mutex so startup blank submission cannot race the worker.
     core::ByteBuffer packet;
     packet.appendUInt8(LaserCubeNetConfig::CMD_SAMPLE_DATA);
     packet.appendUInt8(0x00);
     packet.appendUInt8(messageNumber);
-    packet.appendUInt8(frameNumber);
-
+    packet.appendUInt8(frameNumber++);
     for (const auto& pt : pointsToSend) {
-        // LaserCube Net's scan orientation is mirrored on X relative to the
-        // rest of libera backends, so flip X at controller output.
         packet.appendUInt16(encodeUnsigned12FromSignedUnit(-pt.x));
         packet.appendUInt16(encodeUnsigned12FromSignedUnit(pt.y));
         packet.appendUInt16(encodeUnsigned12FromUnit(pt.r));
@@ -430,7 +556,7 @@ bool LaserCubeNetController::sendPoints() {
         packet.appendUInt16(encodeUnsigned12FromUnit(pt.b));
     }
 
-    const bool success = sendData(packet.data(), packet.size());
+    const bool success = sendDataLocked(packet.data(), packet.size());
     if (success) {
         const auto now = std::chrono::steady_clock::now();
         if (messageTimes[messageNumber] == std::chrono::steady_clock::time_point{}) {
@@ -447,6 +573,11 @@ bool LaserCubeNetController::sendPoints() {
 }
 
 void LaserCubeNetController::syncPointRate() {
+    std::lock_guard<std::timed_mutex> lock(lifecycleMutex);
+    syncPointRateLocked();
+}
+
+void LaserCubeNetController::syncPointRateLocked() {
     const auto desired = getPointRate();
     // Short-circuit when nothing has changed and no resync is pending.
     if (!pointRatePushNeeded && desired == lastSentPointRate) {
@@ -454,20 +585,25 @@ void LaserCubeNetController::syncPointRate() {
     }
     core::ByteBuffer payload;
     payload.appendUInt32(desired);
-    const bool ok = sendCommand(LaserCubeNetConfig::CMD_SET_ILDA_RATE, payload.data(), payload.size());
+    const bool ok = sendCommandLocked(
+        LaserCubeNetConfig::CMD_SET_ILDA_RATE, payload.data(), payload.size());
     if (ok) {
         lastSentPointRate = desired;
         pointRatePushNeeded = false;
     } else {
         // Leave the latch set so the next tick retries.
         pointRatePushNeeded = true;
+        clearOutputIntentLocked();
+        bestEffortOffLocked();
     }
 }
 
-bool LaserCubeNetController::sendData(const std::uint8_t* buffer, std::size_t size) {
+bool LaserCubeNetController::sendDataLocked(const std::uint8_t* buffer, std::size_t size) {
     if (!dataSocket || !buffer || size == 0) {
         recordConnectionError(error_types::network::sendFailed);
         networkConnected.store(false, std::memory_order_relaxed);
+        clearOutputIntentLocked();
+        bestEffortOffLocked();
         return false;
     }
     auto ec = dataSocket->send_to(buffer, size, dataEndpoint, std::chrono::milliseconds(50));
@@ -475,14 +611,18 @@ bool LaserCubeNetController::sendData(const std::uint8_t* buffer, std::size_t si
         logError("[LaserCubeNetController] Failed to send data", ec.message());
         recordConnectionError(error_types::network::sendFailed);
         networkConnected.store(false, std::memory_order_relaxed);
+        clearOutputIntentLocked();
+        bestEffortOffLocked();
         return false;
     }
     return true;
 }
 
 bool LaserCubeNetController::sendCommand(std::uint8_t cmd, const std::uint8_t* payload, std::size_t size) {
-    std::lock_guard<std::mutex> lock(lifecycleMutex);
-    return sendCommandLocked(cmd, payload, size);
+    std::lock_guard<std::timed_mutex> lock(lifecycleMutex);
+    const bool sent = sendCommandLocked(cmd, payload, size);
+    if (!sent) clearOutputIntentLocked();
+    return sent;
 }
 
 bool LaserCubeNetController::sendCommandLocked(
@@ -512,6 +652,261 @@ bool LaserCubeNetController::sendCommandLocked(
     return true;
 }
 
+bool LaserCubeNetController::rotateCommandSocketLocked() {
+    if (commandSocket) {
+        commandSocket->close();
+    }
+
+    commandSocket = std::make_unique<net::UdpSocket>(*io);
+    if (auto error = commandSocket->open_v4()) {
+        recordConnectionError(error_types::network::connectFailed);
+        networkConnected.store(false, std::memory_order_relaxed);
+        clearOutputIntentLocked();
+        return false;
+    }
+
+    std::error_code addressError;
+    const auto bindAddress = libera::net::asio::ip::make_address(
+        networkConfig.localBindAddress, addressError);
+    if (addressError || commandSocket->bind(bindAddress, 0)) {
+        recordConnectionError(error_types::network::connectFailed);
+        networkConnected.store(false, std::memory_order_relaxed);
+        clearOutputIntentLocked();
+        return false;
+    }
+    return true;
+}
+
+bool LaserCubeNetController::sendStartupBlankLocked(const std::size_t packetCount) {
+    const auto blankPointCount = static_cast<std::size_t>(std::clamp(
+        millisToPoints(1.0),
+        1,
+        static_cast<int>(LaserCubeNetConfig::MAX_POINTS_PER_PACKET)));
+
+    for (std::size_t packetIndex = 0; packetIndex < packetCount; ++packetIndex) {
+        core::ByteBuffer packet;
+        packet.appendUInt8(LaserCubeNetConfig::CMD_SAMPLE_DATA);
+        packet.appendUInt8(0x00);
+        packet.appendUInt8(messageNumber);
+        packet.appendUInt8(frameNumber++);
+        for (std::size_t index = 0; index < blankPointCount; ++index) {
+            packet.appendUInt16(encodeUnsigned12FromSignedUnit(0.0f));
+            packet.appendUInt16(encodeUnsigned12FromSignedUnit(0.0f));
+            packet.appendUInt16(encodeUnsigned12FromUnit(0.0f));
+            packet.appendUInt16(encodeUnsigned12FromUnit(0.0f));
+            packet.appendUInt16(encodeUnsigned12FromUnit(0.0f));
+        }
+
+        if (!sendDataLocked(packet.data(), packet.size())) {
+            return false;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (messageTimes[messageNumber] == std::chrono::steady_clock::time_point{}) {
+            ++pendingAckCount;
+        }
+        messageTimes[messageNumber] = now;
+        lastDataSentTime = now;
+        lastDataSentBufferSize += static_cast<int>(blankPointCount);
+        ++messageNumber;
+    }
+    return true;
+}
+
+bool LaserCubeNetController::drainCommandResponsesLocked(
+    const LaserCubeNetOperation& operation) {
+    if (!commandSocket) {
+        return false;
+    }
+
+    std::array<std::uint8_t, 64> discard{};
+    while (!operationStopped(operation)) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            operation.deadline - now);
+        const auto timeout = std::max(
+            std::chrono::milliseconds(1),
+            std::min(std::chrono::milliseconds(2), remaining));
+        libera::net::asio::ip::udp::endpoint sender;
+        std::size_t received = 0;
+        const auto error = commandSocket->recv_from(
+            discard.data(), discard.size(), sender, received, timeout, false);
+        if (error == libera::net::asio::error::timed_out) {
+            return true;
+        }
+        if (error == libera::net::asio::error::operation_aborted) {
+            return false;
+        }
+        if (error) {
+            return false;
+        }
+    }
+    return false;
+}
+
+bool LaserCubeNetController::confirmStartupDeliveryLocked(
+    const LaserCubeNetOperation& operation) {
+    // This barrier proves only that the all-black startup content was accepted
+    // before output-on. It is never used as output or clear evidence.
+    while (pendingAckCount > 0 && !operationStopped(operation)) {
+        checkAcksLocked();
+        if (pendingAckCount > 0) std::this_thread::yield();
+    }
+    return pendingAckCount == 0;
+}
+
+LaserCubeNetLifecycleResult LaserCubeNetController::darkSequenceLocked(
+    const LaserCubeNetOperation& operation,
+    const bool configureTransport) {
+    LaserCubeNetLifecycleReport report;
+    const std::uint8_t disabled = 0;
+
+    while (!operationStopped(operation)) {
+        // Retire sample acknowledgements from the prior output generation.
+        // They never gate the first off or contribute to dark confirmation.
+        messageTimes.fill(std::chrono::steady_clock::time_point{});
+        pendingAckCount = 0;
+        // Each attempt owns a fresh receive endpoint. A response delayed from
+        // an older lifecycle epoch targets the retired port and is ineligible.
+        if (!rotateCommandSocketLocked()) {
+            return LaserCubeNetLifecycleResult::failure(
+                std::make_error_code(std::errc::io_error), report);
+        }
+        if (!sendCommandLocked(LaserCubeNetConfig::CMD_SET_OUTPUT, &disabled, 1)) {
+            clearOutputIntentLocked();
+            return LaserCubeNetLifecycleResult::failure(
+                std::make_error_code(std::errc::io_error), report);
+        }
+        report.evidence = LaserCubeNetRemoteEvidence::HostDarkRequested;
+        setLastLifecycleReport(report);
+
+        if (!sendCommandLocked(LaserCubeNetConfig::CMD_CLEAR_RINGBUFFER, nullptr, 0) ||
+            !drainCommandResponsesLocked(operation) ||
+            !sendCommandLocked(LaserCubeNetConfig::CMD_SET_OUTPUT, &disabled, 1)) {
+            clearOutputIntentLocked();
+            setLastLifecycleReport(report);
+            return LaserCubeNetLifecycleResult::failure(
+                operationStopped(operation)
+                    ? std::make_error_code(operation.cancelled && operation.cancelled()
+                                               ? std::errc::operation_canceled
+                                               : std::errc::timed_out)
+                    : std::make_error_code(std::errc::io_error),
+                report);
+        }
+        const auto finalOffRequestTime = std::chrono::steady_clock::now();
+
+        if (configureTransport) {
+            core::ByteBuffer ratePayload;
+            ratePayload.appendUInt32(getPointRate());
+            if (!sendCommandLocked(
+                    LaserCubeNetConfig::CMD_ENABLE_BUFFER_RESPONSE, nullptr, 0) ||
+                !sendCommandLocked(
+                    LaserCubeNetConfig::CMD_SET_ILDA_RATE,
+                    ratePayload.data(), ratePayload.size())) {
+                clearOutputIntentLocked();
+                setLastLifecycleReport(report);
+                return LaserCubeNetLifecycleResult::failure(
+                    std::make_error_code(std::errc::io_error), report);
+            }
+            lastSentPointRate = getPointRate();
+            pointRatePushNeeded = false;
+        }
+
+        auto status = requestFreshStatus(operation, finalOffRequestTime);
+        if (!status) {
+            clearOutputIntentLocked();
+            setLastLifecycleReport(report);
+            return LaserCubeNetLifecycleResult::failure(status.error(), report);
+        }
+
+        report.status = *status;
+        report.hasFreshStatus = true;
+        report.bufferCapacitySupported = status->bufferMax > 0;
+        report.bufferConfirmedEmpty =
+            report.bufferCapacitySupported && status->bufferFree == status->bufferMax;
+        setLastLifecycleReport(report);
+
+        const bool bufferAcceptable =
+            !report.bufferCapacitySupported || report.bufferConfirmedEmpty;
+        if (!status->outputEnabled && bufferAcceptable) {
+            report.evidence = LaserCubeNetRemoteEvidence::DeviceReportedDisabled;
+            setLastLifecycleReport(report);
+            remoteEnabledConfirmed = false;
+            lastReportedBufferFullness.store(0, std::memory_order_relaxed);
+            lastEstimatedBufferFullness.store(0, std::memory_order_relaxed);
+            lastDataSentBufferSize = 0;
+            lastDataSentTime = std::chrono::steady_clock::now();
+            lastAckTime = lastDataSentTime;
+            messageTimes.fill(std::chrono::steady_clock::time_point{});
+            pendingAckCount = 0;
+            return LaserCubeNetLifecycleResult::success(report);
+        }
+
+        // State did not reflect this attempt. Rotate the receive epoch and
+        // retry the complete off-clear-off sequence while budget remains.
+        report.evidence = LaserCubeNetRemoteEvidence::HostDarkRequested;
+        clearOutputIntentLocked();
+        setLastLifecycleReport(report);
+    }
+
+    return LaserCubeNetLifecycleResult::failure(
+        std::make_error_code(operation.cancelled && operation.cancelled()
+                                 ? std::errc::operation_canceled
+                                 : std::errc::timed_out),
+        report);
+}
+
+void LaserCubeNetController::clearOutputIntentLocked() noexcept {
+    std::lock_guard<std::mutex> intentLock(outputIntentMutex);
+    streamingAllowed.store(false, std::memory_order_release);
+    remoteEnabledConfirmed = false;
+    setArmed(false);
+    outputGeneration.fetch_add(1, std::memory_order_acq_rel);
+}
+
+std::uint64_t LaserCubeNetController::beginEnableIntentLocked() noexcept {
+    std::lock_guard<std::mutex> intentLock(outputIntentMutex);
+    streamingAllowed.store(false, std::memory_order_release);
+    remoteEnabledConfirmed = false;
+    setArmed(false);
+    return outputGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+bool LaserCubeNetController::commitEnableIntentLocked(
+    const std::uint64_t expectedGeneration) noexcept {
+    std::lock_guard<std::mutex> intentLock(outputIntentMutex);
+    if (outputGeneration.load(std::memory_order_acquire) != expectedGeneration) {
+        return false;
+    }
+    setArmed(true);
+    streamingAllowed.store(true, std::memory_order_release);
+    remoteEnabledConfirmed = true;
+    outputGeneration.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+void LaserCubeNetController::bestEffortOffLocked() noexcept {
+    if (!commandSocket) {
+        return;
+    }
+    const std::uint8_t disabled = 0;
+    (void)sendCommandLocked(LaserCubeNetConfig::CMD_SET_OUTPUT, &disabled, 1);
+}
+
+bool LaserCubeNetController::lockLifecycle(
+    const LaserCubeNetOperation& operation,
+    std::unique_lock<std::timed_mutex>& lock) {
+    while (!operationStopped(operation)) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto nextPoll = std::min(
+            operation.deadline, now + std::chrono::milliseconds(2));
+        if (lock.try_lock_until(nextPoll)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool LaserCubeNetController::operationStopped(const LaserCubeNetOperation& operation) const {
     return std::chrono::steady_clock::now() >= operation.deadline ||
            (operation.cancelled && operation.cancelled());
@@ -529,6 +924,7 @@ libera::expected<LaserCubeNetStatus> LaserCubeNetController::requestFreshStatus(
         if (!sendCommandLocked(LaserCubeNetConfig::CMD_GET_FULL_INFO, nullptr, 0)) {
             return libera::unexpected(std::make_error_code(std::errc::io_error));
         }
+        const auto probeSentAt = std::chrono::steady_clock::now();
 
         const auto now = std::chrono::steady_clock::now();
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -548,8 +944,9 @@ libera::expected<LaserCubeNetStatus> LaserCubeNetController::requestFreshStatus(
             return libera::unexpected(ec);
         }
         const auto receivedAt = std::chrono::steady_clock::now();
+        const auto epochBarrier = std::max(newerThan, probeSentAt);
         if (sender.address() != commandEndpoint.address() ||
-            sender.port() != commandEndpoint.port() || receivedAt <= newerThan) {
+            sender.port() != commandEndpoint.port() || receivedAt <= epochBarrier) {
             continue;
         }
         auto status = LaserCubeNetStatus::parse(buffer.data(), received);
@@ -571,7 +968,7 @@ libera::expected<LaserCubeNetStatus> LaserCubeNetController::requestFreshStatus(
                                  : std::errc::timed_out));
 }
 
-void LaserCubeNetController::checkAcks() {
+void LaserCubeNetController::checkAcksLocked() {
     if (!dataSocket) {
         return;
     }
@@ -716,6 +1113,8 @@ void LaserCubeNetController::checkAcks() {
                 recordConnectionError(error_types::network::connectionLost);
                 networkConnected.store(false, std::memory_order_relaxed);
                 setConnectionState(false);
+                clearOutputIntentLocked();
+                bestEffortOffLocked();
                 return;
             }
         }
