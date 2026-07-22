@@ -11,16 +11,39 @@ namespace libera::lasercubenet {
 
 LaserCubeNetManager::LaserCubeNetManager(LaserCubeNetNetworkConfig networkConfigValue)
     : networkConfig(std::move(networkConfigValue)) {
+    networkError = networkConfig.validate();
+    if (networkError) {
+        logError("[LaserCubeNetManager] invalid network configuration");
+        listenerFinished.store(true, std::memory_order_release);
+        return;
+    }
+
     io = net::shared_io_context();
     socket = std::make_unique<net::UdpSocket>(*io);
-    if (!socket->open_v4()) {
-        socket->enable_broadcast(true);
-        std::error_code addressError;
-        const auto bindAddress = asio::ip::make_address(
-            networkConfig.localBindAddress, addressError);
-        if (!addressError) {
-            socket->bind(bindAddress, networkConfig.discoveryBindPort);
-        }
+    networkError = socket->open_v4();
+    if (networkError) {
+        listenerFinished.store(true, std::memory_order_release);
+        return;
+    }
+    networkError = socket->enable_broadcast(true);
+    if (networkError) {
+        socket->close();
+        listenerFinished.store(true, std::memory_order_release);
+        return;
+    }
+
+    std::error_code addressError;
+    const auto bindAddress = asio::ip::make_address(
+        networkConfig.localBindAddress, addressError);
+    if (addressError) {
+        networkError = std::make_error_code(std::errc::invalid_argument);
+    } else {
+        networkError = socket->bind(bindAddress, networkConfig.discoveryBindPort);
+    }
+    if (networkError) {
+        socket->close();
+        listenerFinished.store(true, std::memory_order_release);
+        return;
     }
     running.store(true);
     listenerFinished.store(false, std::memory_order_relaxed);
@@ -118,7 +141,13 @@ void LaserCubeNetManager::discoveryThread() {
             }
         }
 
-        std::this_thread::sleep_for(networkConfig.discoveryInterval);
+        // Shutdown wakes this wait immediately; discoveryInterval is only the
+        // normal production cadence, never an uninterruptible close delay.
+        std::unique_lock<std::mutex> waitLock(listenerWaitMutex);
+        listenerWaitChanged.wait_for(
+            waitLock,
+            networkConfig.discoveryInterval,
+            [this] { return !running.load(); });
     }
 }
 
@@ -172,11 +201,15 @@ void LaserCubeNetManager::prepareExistingController(LaserCubeNetController& cont
 
 void LaserCubeNetManager::beforeCloseControllers() {
     running.store(false);
+    listenerWaitChanged.notify_all();
     if (socket) {
         socket->close();
     }
-    core::timedJoin(listener, listenerFinished, std::chrono::milliseconds(3000),
-                    "LaserCubeNetManager::listener");
+    // All listener waits above are now deadline-bounded and wakeable. Joining
+    // preserves object lifetime and cannot leave a detached thread using this.
+    if (listener.joinable()) {
+        listener.join();
+    }
 }
 
 void LaserCubeNetManager::afterCloseControllers() {

@@ -14,6 +14,7 @@
 #include "libera/core/ThreadUtils.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -29,6 +30,7 @@ public:
     ~LaserCubeNetManager() override;
 
     std::vector<std::unique_ptr<core::ControllerInfo>> discover() override;
+    [[nodiscard]] std::error_code getNetworkError() const { return networkError; }
 
     static core::ControllerManagerRegistry registrar;
 
@@ -47,10 +49,13 @@ private:
     std::thread listener;
     std::atomic<bool> running{false};
     std::atomic<bool> listenerFinished{false};
+    std::mutex listenerWaitMutex;
+    std::condition_variable listenerWaitChanged;
 
     std::mutex controllersMutex;
     std::unordered_map<std::string, ControllerEntry> controllers;
     LaserCubeNetNetworkConfig networkConfig;
+    std::error_code networkError;
 
     ControllerPtr createController(const LaserCubeNetControllerInfo& info) override;
     NewControllerDisposition prepareNewController(LaserCubeNetController& controller,

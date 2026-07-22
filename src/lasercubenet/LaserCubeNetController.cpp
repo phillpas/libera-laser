@@ -65,6 +65,11 @@ libera::expected<void> LaserCubeNetController::connect(const LaserCubeNetControl
 }
 
 libera::expected<void> LaserCubeNetController::connectToStatus(const LaserCubeNetStatus& status) {
+    if (auto configError = networkConfig.validate()) {
+        recordConnectionError(error_types::network::connectFailed);
+        return libera::unexpected(configError);
+    }
+
     ipAddress = status.ipAddress;
     maxPointRate.store(status.pointRateMax, std::memory_order_relaxed);
     pointBufferCapacity.store(status.bufferMax, std::memory_order_relaxed);

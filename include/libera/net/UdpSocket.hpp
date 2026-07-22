@@ -1,9 +1,12 @@
 #pragma once
 #include "libera/net/NetConfig.hpp"
+#include "libera/log/Log.hpp"
+
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include "libera/net/Deadline.hpp"
 
 namespace libera::net {
 
@@ -12,9 +15,11 @@ namespace libera::net {
  *
  * Small helper for UDP use-cases like controller discovery or broadcast.
  *
- * Notes for openFrameworks users:
- * - UDP in Asio is also async; here we provide `send_to` / `recv_from` that use
- *   the same `with_deadline` pattern as TCP to provide timeouts.
+ * LaserCubeNet calls this synchronous facade from its own worker threads. The
+ * underlying socket is nonblocking, so each operation is bounded by the
+ * caller's monotonic deadline without relying on the shared Asio executor.
+ * close() sets a wake flag before waiting for the serialized socket operation,
+ * giving shutdown a strict polling bound even if that executor is stopped.
  * - Enable broadcast on macOS/Linux by setting the socket option when needed.
  */
 class UdpSocket {
@@ -22,8 +27,17 @@ public:
     explicit UdpSocket(asio::io_context& io) : sock(io) {}
 
     std::error_code open_v4(bool logFailure = true) {
+        std::lock_guard<std::mutex> lock(socketMutex);
+        closeRequested.store(false, std::memory_order_release);
         std::error_code ec;
         sock.open(udp::v4(), ec);
+        if (!ec) {
+            sock.non_blocking(true, ec);
+            if (ec) {
+                std::error_code ignored;
+                sock.close(ignored);
+            }
+        }
         if (ec && logFailure) {
             logError("[UdpSocket] open_v4 failed", ec.message());
         }
@@ -31,6 +45,7 @@ public:
     }
 
     std::error_code bind_any(uint16_t port, bool logFailure = true) {
+        std::lock_guard<std::mutex> lock(socketMutex);
         std::error_code ec;
         sock.bind(udp::endpoint(udp::v4(), port), ec);
         if (ec && logFailure) {
@@ -42,6 +57,7 @@ public:
     std::error_code bind(const asio::ip::address& address,
                          uint16_t port,
                          bool logFailure = true) {
+        std::lock_guard<std::mutex> lock(socketMutex);
         std::error_code ec;
         sock.bind(udp::endpoint(address, port), ec);
         if (ec && logFailure) {
@@ -51,20 +67,43 @@ public:
     }
 
     std::error_code enable_broadcast(bool on=true) {
+        std::lock_guard<std::mutex> lock(socketMutex);
         std::error_code ec;
         sock.set_option(asio::socket_base::broadcast(on), ec);
         return ec;
     }
 
-    // Send a datagram, fail if not sent within timeout.
+    // Send a datagram or return timed_out at the supplied monotonic deadline.
     std::error_code send_to(const void* data, std::size_t n,
-                                      const udp::endpoint& ep, std::chrono::milliseconds timeout,
-                                      bool logTimeout = true) {
-        auto ex = sock.get_executor();
-        return with_deadline(ex, timeout,
-            [&](auto cb){ sock.async_send_to(asio::buffer(data, n), ep, 0, cb); },
-            [&]{ cancelNoThrow(); },
-            "udp_send", logTimeout);
+                            const udp::endpoint& ep,
+                            std::chrono::milliseconds timeout,
+                            bool logTimeout = true) {
+        if (!data || n == 0 || timeout <= std::chrono::milliseconds::zero()) {
+            return std::make_error_code(std::errc::invalid_argument);
+        }
+
+        std::unique_lock<std::mutex> socketLock(socketMutex);
+        const auto deadline = Clock::now() + timeout;
+        for (;;) {
+            if (closeRequested.load(std::memory_order_acquire)) {
+                return asio::error::operation_aborted;
+            }
+
+            std::error_code ec;
+            const auto sent = sock.send_to(asio::buffer(data, n), ep, 0, ec);
+            if (!ec) {
+                return sent == n ? std::error_code{} : asio::error::message_size;
+            }
+            if (!wouldBlock(ec)) {
+                return ec;
+            }
+            if (!waitForRetry(deadline)) {
+                if (logTimeout) {
+                    logInfo("[UdpSocket] send deadline expired after", timeout.count(), "ms");
+                }
+                return asio::error::timed_out;
+            }
+        }
     }
 
     // Receive one datagram, with timeout. Returns ec + fills out_ep + out_n.
@@ -72,65 +111,80 @@ public:
                                         udp::endpoint& out_ep, std::size_t& out_n,
                                         std::chrono::milliseconds timeout,
                                         bool logTimeout = true) {
-        auto ex = sock.get_executor();
-        // Keep these alive even if the handler fires after this call returns.
-        auto receivedPtr = std::make_shared<std::size_t>(0);
-        auto endpointPtr = std::make_shared<udp::endpoint>();
+        out_n = 0;
+        out_ep = {};
+        if (!data || max == 0 || timeout <= std::chrono::milliseconds::zero()) {
+            return std::make_error_code(std::errc::invalid_argument);
+        }
 
-        auto ec = with_deadline(ex, timeout,
-            [&](auto cb){
-                sock.async_receive_from(asio::buffer(data, max), *endpointPtr, 0,
-                    [cb, receivedPtr, endpointPtr](const std::error_code& ec, std::size_t n){
-                        *receivedPtr = n;
-                        cb(ec);
-                    });
-            },
-            [&]{ cancelNoThrow(); },
-            "udp_recv", logTimeout);
+        std::unique_lock<std::mutex> socketLock(socketMutex);
+        const auto deadline = Clock::now() + timeout;
+        for (;;) {
+            if (closeRequested.load(std::memory_order_acquire)) {
+                return asio::error::operation_aborted;
+            }
 
-        // Copy back results for the caller.
-        out_n = *receivedPtr;
-        out_ep = *endpointPtr;
-        return ec;
+            std::error_code ec;
+            out_n = sock.receive_from(asio::buffer(data, max), out_ep, 0, ec);
+            if (!ec) {
+                return {};
+            }
+            out_n = 0;
+            out_ep = {};
+            if (!wouldBlock(ec)) {
+                return ec;
+            }
+            if (!waitForRetry(deadline)) {
+                if (logTimeout) {
+                    logInfo("[UdpSocket] receive deadline expired after", timeout.count(), "ms");
+                }
+                return asio::error::timed_out;
+            }
+        }
     }
 
     udp::socket& raw() { return sock; }
-    void close() {
-        struct CloseState {
-            std::mutex mutex;
-            std::condition_variable cv;
-            bool done = false;
-        };
+    void close() noexcept {
+        // Signalling does not need the socket lock, so a blocked receive wakes
+        // before close waits to serialize access to the Asio socket object.
+        closeRequested.store(true, std::memory_order_release);
+        retryChanged.notify_all();
 
-        auto state = std::make_shared<CloseState>();
-        auto closeOnExecutor = [this, state] {
-            std::error_code ignored;
-            sock.cancel(ignored);
-            sock.close(ignored);
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->done = true;
-            }
-            state->cv.notify_one();
-        };
-
-        try {
-            // dispatch executes inline when close() is called by the I/O thread
-            // and queues otherwise. Either way, socket cancellation/close is
-            // serialized with async initiation and completion.
-            asio::dispatch(sock.get_executor(), std::move(closeOnExecutor));
-        } catch (...) {
-            return;
-        }
-
-        std::unique_lock<std::mutex> lock(state->mutex);
-        state->cv.wait(lock, [&] { return state->done; });
+        std::lock_guard<std::mutex> lock(socketMutex);
+        std::error_code ignored;
+        sock.close(ignored);
     }
 
 private:
-    void cancelNoThrow() { std::error_code ignore; sock.cancel(ignore); }
+    using Clock = std::chrono::steady_clock;
+    static constexpr auto IO_POLL_INTERVAL = std::chrono::milliseconds(2);
+
+    static bool wouldBlock(const std::error_code& ec) {
+        return ec == asio::error::would_block || ec == asio::error::try_again;
+    }
+
+    bool waitForRetry(Clock::time_point deadline) {
+        const auto now = Clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+
+        // UDP readiness is polled at a documented two-millisecond maximum.
+        // close() wakes this condition variable immediately instead of waiting
+        // for the next poll, satisfying priority-shutdown cancellation needs.
+        std::unique_lock<std::mutex> waitLock(retryMutex);
+        retryChanged.wait_until(
+            waitLock,
+            std::min(deadline, now + IO_POLL_INTERVAL),
+            [this] { return closeRequested.load(std::memory_order_acquire); });
+        return Clock::now() < deadline;
+    }
 
     udp::socket sock;
+    std::mutex socketMutex;
+    std::mutex retryMutex;
+    std::condition_variable retryChanged;
+    std::atomic<bool> closeRequested{false};
 };
 
 } // namespace libera::net

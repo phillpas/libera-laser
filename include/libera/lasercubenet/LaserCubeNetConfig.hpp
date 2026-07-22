@@ -1,10 +1,12 @@
 #pragma once
 
 #include "libera/core/BufferEstimator.hpp"
+#include "libera/net/NetConfig.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace libera::lasercubenet {
@@ -48,15 +50,61 @@ struct LaserCubeNetConfig {
 // Injectable network endpoints and deadlines for deterministic loopback tests.
 // Defaults preserve the production LaserCubeNet broadcast behavior.
 struct LaserCubeNetNetworkConfig {
+    // These caps reject accidental near-infinite waits while remaining far
+    // above every production default. OperationControl callers can therefore
+    // use the configured values as strict per-call latency bounds.
+    static constexpr std::size_t MAX_DISCOVERY_DESTINATIONS = 64;
+    static constexpr auto MAX_SOCKET_TIMEOUT = std::chrono::seconds(1);
+    static constexpr auto MAX_DISCOVERY_DURATION = std::chrono::seconds(60);
+
     std::vector<std::string> discoveryDestinations{"255.255.255.255"};
     std::string localBindAddress{"0.0.0.0"};
     std::uint16_t discoveryBindPort = LaserCubeNetConfig::COMMAND_PORT;
     std::uint16_t commandPort = LaserCubeNetConfig::COMMAND_PORT;
     std::uint16_t dataPort = LaserCubeNetConfig::DATA_PORT;
     std::chrono::milliseconds sendTimeout{200};
-    std::chrono::milliseconds receivePollTimeout{50};
+    // Preserve the original LaserCubeNet polling cadence when no seam is used.
+    std::chrono::milliseconds receivePollTimeout{500};
     std::chrono::milliseconds discoveryWindow{1000};
     std::chrono::milliseconds discoveryInterval{250};
+
+    [[nodiscard]] std::error_code validate() const {
+        if (discoveryDestinations.empty() ||
+            discoveryDestinations.size() > MAX_DISCOVERY_DESTINATIONS ||
+            localBindAddress.empty() || discoveryBindPort == 0 ||
+            commandPort == 0 || dataPort == 0 ||
+            !validSocketTimeout(sendTimeout) || !validSocketTimeout(receivePollTimeout) ||
+            !validDiscoveryDuration(discoveryWindow) ||
+            !validDiscoveryDuration(discoveryInterval) ||
+            receivePollTimeout > discoveryWindow) {
+            return std::make_error_code(std::errc::invalid_argument);
+        }
+
+        std::error_code addressError;
+        const auto localAddress = net::asio::ip::make_address(localBindAddress, addressError);
+        if (addressError || !localAddress.is_v4()) {
+            return std::make_error_code(std::errc::invalid_argument);
+        }
+        for (const auto& destination : discoveryDestinations) {
+            addressError.clear();
+            const auto address = net::asio::ip::make_address(destination, addressError);
+            if (addressError || !address.is_v4()) {
+                return std::make_error_code(std::errc::invalid_argument);
+            }
+        }
+        return {};
+    }
+
+private:
+    static bool validSocketTimeout(std::chrono::milliseconds duration) {
+        return duration > std::chrono::milliseconds::zero() &&
+               duration <= MAX_SOCKET_TIMEOUT;
+    }
+
+    static bool validDiscoveryDuration(std::chrono::milliseconds duration) {
+        return duration > std::chrono::milliseconds::zero() &&
+               duration <= MAX_DISCOVERY_DURATION;
+    }
 };
 
 } // namespace libera::lasercubenet
