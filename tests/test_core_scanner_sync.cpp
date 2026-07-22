@@ -1,7 +1,9 @@
 #include "libera/core/LaserControllerStreaming.hpp"
 #include "libera/log/Log.hpp"
 
+#include <atomic>
 #include <cstddef>
+#include <thread>
 #include <vector>
 
 using namespace libera;
@@ -141,7 +143,6 @@ void testZeroSyncNoDelay() {
     request.maximumPointsRequired = 5;
 
     ASSERT_TRUE(controller.requestPoints(request), "requestPoints succeeds");
-    const auto& batch = controller.lastBatch();
 
     // With zero sync, colour should pass through unmodified (after startup blank).
     // But point 0 is blanked by the startup blank (1ms = 10 points at 10kpps).
@@ -192,6 +193,56 @@ void testDisarmedForcesBlack() {
     }
 }
 
+// ── Arm transitions concurrent with point processing ────────────────────────
+
+void testArmTransitionsAreSafeDuringPointProcessing() {
+    ScannerSyncHarness controller;
+    controller.setPointRate(30000);
+    controller.setScannerSync(10.0);
+    controller.setRequestPointsCallback(
+        [](const PointFillRequest& req, std::vector<LaserPoint>& out) {
+            for (std::size_t i = 0; i < req.maximumPointsRequired; ++i) {
+                LaserPoint point{};
+                point.x = 0.25f;
+                point.y = -0.25f;
+                point.r = 1.0f;
+                out.push_back(point);
+            }
+        });
+
+    PointFillRequest request{};
+    request.minimumPointsRequired = 64;
+    request.maximumPointsRequired = 64;
+
+    constexpr int iterationCount = 5000;
+    std::atomic<bool> start{false};
+
+    std::thread pointThread([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int i = 0; i < iterationCount; ++i) {
+            controller.requestPoints(request);
+        }
+    });
+
+    std::thread lifecycleThread([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int i = 0; i < iterationCount; ++i) {
+            controller.setArmed((i % 2) == 0);
+        }
+    });
+
+    start.store(true, std::memory_order_release);
+    pointThread.join();
+    lifecycleThread.join();
+
+    ASSERT_EQ(controller.lastBatch().size(), std::size_t{64},
+              "concurrent arm transitions preserve complete point batches");
+}
+
 } // namespace
 
 int main() {
@@ -201,6 +252,7 @@ int main() {
     testColourDelayShiftsRGB();
     testZeroSyncNoDelay();
     testDisarmedForcesBlack();
+    testArmTransitionsAreSafeDuringPointProcessing();
 
     if (g_failures) {
         logError("Tests failed", g_failures, "failure(s)");
