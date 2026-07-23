@@ -115,6 +115,10 @@ void testParsesBasicFields() {
     ASSERT_TRUE(result.has_value(), "parse should succeed");
 
     const auto& s = *result;
+    ASSERT_EQ(s.rawPayload.size(), packet.size(), "raw payload size");
+    for (std::size_t index = 0; index < packet.size(); ++index) {
+        ASSERT_EQ(s.rawPayload[index], packet[index], "raw payload byte");
+    }
     ASSERT_EQ(s.firmwareMajor, static_cast<std::uint8_t>(1), "firmware major");
     ASSERT_EQ(s.firmwareMinor, static_cast<std::uint8_t>(5), "firmware minor");
     ASSERT_TRUE(s.firmwareVersion == "1.5", "firmware version string");

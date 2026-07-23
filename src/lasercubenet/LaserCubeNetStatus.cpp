@@ -23,6 +23,7 @@ std::optional<LaserCubeNetStatus> LaserCubeNetStatus::parse(const std::uint8_t* 
     }
 
     LaserCubeNetStatus status;
+    std::memcpy(status.rawPayload.data(), data, status.rawPayload.size());
     status.payloadVersion = data[2];
     if (status.payloadVersion != 0) {
         return std::nullopt; // unknown payload revision

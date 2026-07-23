@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -8,6 +10,9 @@
 namespace libera::lasercubenet {
 
 struct LaserCubeNetStatus {
+    static constexpr std::size_t RawPayloadSize = 64;
+
+    std::array<std::uint8_t, RawPayloadSize> rawPayload{};
     std::uint8_t payloadVersion = 0;
     std::uint8_t firmwareMajor = 0;
     std::uint8_t firmwareMinor = 0;
