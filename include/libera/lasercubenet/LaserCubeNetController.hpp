@@ -37,6 +37,7 @@ enum class LaserCubeNetRemoteEvidence {
     HostDarkRequested,
     DeviceReportedDisabled,
     HostEnableRequested,
+    DeviceAcknowledgedEnabled,
     DeviceReportedEnabled
 };
 
@@ -135,6 +136,10 @@ private:
         const LaserCubeNetOperation& operation,
         std::uint64_t acknowledgementTarget);
     bool drainCommandResponsesLocked(const LaserCubeNetOperation& operation);
+    bool confirmCommandResponsesLocked(
+        std::uint8_t command,
+        std::size_t count,
+        const LaserCubeNetOperation& operation);
     libera::expected<LaserCubeNetStatus> requestFreshStatus(
         const LaserCubeNetOperation& operation,
         std::chrono::steady_clock::time_point newerThan);

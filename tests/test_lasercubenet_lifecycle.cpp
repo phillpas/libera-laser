@@ -103,10 +103,12 @@ public:
     LaserCubeNetStatus status() const {
         LaserCubeNetStatus value;
         value.payloadVersion = 0;
-        value.firmwareMajor = 1;
-        value.firmwareMinor = 13;
-        value.firmwareVersion = "1.13";
-        value.outputEnabled = outputEnabled.load();
+        value.firmwareMajor = firmwareMajor.load();
+        value.firmwareMinor = firmwareMinor.load();
+        value.firmwareVersion =
+            std::to_string(value.firmwareMajor) + "." +
+            std::to_string(value.firmwareMinor);
+        value.outputEnabled = suppressOutputFlag.load() ? false : outputEnabled.load();
         value.pointRate = 30000;
         value.pointRateMax = 30000;
         value.bufferFree = bufferFree.load();
@@ -134,6 +136,11 @@ public:
     }
 
     void forceOutput(bool enabled) { outputEnabled.store(enabled); }
+    void setFirmware(std::uint8_t major, std::uint8_t minor) {
+        firmwareMajor.store(major);
+        firmwareMinor.store(minor);
+    }
+    void suppressReportedOutputFlag(bool value) { suppressOutputFlag.store(value); }
     void forceBuffer(std::uint16_t free, std::uint16_t maximum) {
         bufferMax.store(maximum);
         bufferFree.store(free);
@@ -143,6 +150,12 @@ public:
     void dropNextClear(int count = 1) { dropClear.store(count); }
     void dropNextStatus(int count = 1) { dropStatus.store(count); }
     void malformNextStatus(int count = 1) { malformedStatus.store(count); }
+    void reportDisabledForNextEnableStatuses(int count) {
+        staleEnableStatuses.store(count);
+    }
+    void requirePostEnableData(bool value) {
+        requirePostEnableSamples.store(value);
+    }
     void holdStatus(bool value) { holdStatuses.store(value); }
     void clearPendingStatuses() {
         std::lock_guard<std::mutex> lock(mutex);
@@ -476,8 +489,8 @@ private:
         const auto current = status();
         std::array<std::uint8_t, 64> packet{};
         packet[2] = malformed ? 0xff : 0;
-        packet[3] = 1;
-        packet[4] = 13;
+        packet[3] = firmwareMajor.load();
+        packet[4] = firmwareMinor.load();
         packet[5] = current.outputEnabled ? 1 : 0;
         writeLe32(&packet[10], current.pointRate);
         writeLe32(&packet[14], current.pointRateMax);
@@ -536,15 +549,21 @@ private:
 
             if (input[0] == LaserCubeNetConfig::CMD_SET_OUTPUT && received >= 2) {
                 if (input[1] == 0) {
+                    enableWaitingForSamples.store(false);
                     if (!consume(dropOff) && !ignoreAllOff.load()) outputEnabled.store(false);
                 } else {
-                    outputEnabled.store(true);
+                    const bool waitForSamples = requirePostEnableSamples.load();
+                    enableWaitingForSamples.store(waitForSamples);
+                    outputEnabled.store(!waitForSamples);
                 }
             } else if (input[0] == LaserCubeNetConfig::CMD_CLEAR_RINGBUFFER) {
                 if (!consume(dropClear)) bufferFree.store(bufferMax.load());
             } else if (input[0] == LaserCubeNetConfig::CMD_GET_FULL_INFO) {
                 if (consume(dropStatus)) continue;
-                const auto packet = statusPacket(consume(malformedStatus));
+                auto packet = statusPacket(consume(malformedStatus));
+                if (consume(staleEnableStatuses)) {
+                    packet[5] &= static_cast<std::uint8_t>(~std::uint8_t{1});
+                }
                 if (holdStatuses.load()) {
                     std::lock_guard<std::mutex> lock(mutex);
                     pendingStatuses.push_back(PendingStatus{sender, packet});
@@ -553,7 +572,11 @@ private:
                     (void)commandSocket.send_to(
                         packet.data(), packet.size(), sender, 20ms, false);
                 }
+                continue;
             }
+            const std::array<std::uint8_t, 2> acknowledgement{input[0], 0};
+            (void)commandSocket.send_to(
+                acknowledgement.data(), acknowledgement.size(), sender, 20ms, false);
         }
     }
 
@@ -587,6 +610,9 @@ private:
                                          [](std::uint8_t value) { return value != 0; });
             }
             record(input[0], true, lit, sender.port());
+            if (enableWaitingForSamples.exchange(false)) {
+                outputEnabled.store(true);
+            }
             const auto points = static_cast<std::uint16_t>((received - 4) / 10);
             const auto free = bufferFree.load();
             bufferFree.store(points >= free ? 0 : static_cast<std::uint16_t>(free - points));
@@ -623,6 +649,9 @@ private:
     std::uint16_t dataPort = 0;
     std::atomic<bool> running{true};
     std::atomic<bool> outputEnabled{true};
+    std::atomic<std::uint8_t> firmwareMajor{1};
+    std::atomic<std::uint8_t> firmwareMinor{13};
+    std::atomic<bool> suppressOutputFlag{false};
     std::atomic<std::uint16_t> bufferFree{500};
     std::atomic<std::uint16_t> bufferMax{1000};
     std::atomic<bool> ignoreAllOff{false};
@@ -630,6 +659,9 @@ private:
     std::atomic<int> dropClear{0};
     std::atomic<int> dropStatus{0};
     std::atomic<int> malformedStatus{0};
+    std::atomic<int> staleEnableStatuses{0};
+    std::atomic<bool> requirePostEnableSamples{false};
+    std::atomic<bool> enableWaitingForSamples{false};
     std::atomic<bool> holdStatuses{false};
     std::atomic<bool> reorderAcks{false};
     std::atomic<bool> duplicateAcks{false};
@@ -804,6 +836,59 @@ void connectEnableDisableShutdownIsOrdered() {
         firstCloseOff->senderPort);
     CHECK(std::none_of(closeEvents.begin(), closeEvents.end(),
                        [](const Event& event) { return event.data; }));
+}
+
+void enableWaitsForDeviceReportedStateToConverge() {
+    LoopbackCube cube;
+    LaserCubeNetControllerInfo info(cube.status());
+    LaserCubeNetController controller(info, cube.network());
+    CHECK(controller.connectDark(info, LaserCubeNetOperation::withTimeout(500ms)));
+    installLitCallback(controller);
+    controller.startThread();
+
+    const auto statusCount =
+        cube.commandCount(LaserCubeNetConfig::CMD_GET_FULL_INFO);
+    cube.requirePostEnableData(true);
+    cube.reportDisabledForNextEnableStatuses(2);
+    const auto enabled =
+        controller.enableOutput(LaserCubeNetOperation::withTimeout(500ms));
+    CHECK(enabled);
+    CHECK(enabled->evidence == LaserCubeNetRemoteEvidence::DeviceReportedEnabled);
+    CHECK(enabled->hasFreshStatus);
+    CHECK(enabled->status.outputEnabled);
+    CHECK(cube.commandCount(LaserCubeNetConfig::CMD_GET_FULL_INFO) >= statusCount + 3);
+    const auto events = cube.events();
+    const auto outputOn = std::find_if(events.begin(), events.end(), [](const Event& event) {
+        return !event.data && event.command == LaserCubeNetConfig::CMD_SET_OUTPUT &&
+               event.outputRequest == 1;
+    });
+    CHECK(outputOn != events.end());
+    CHECK(std::any_of(outputOn, events.end(), [](const Event& event) {
+        return event.data && !event.lit;
+    }));
+
+    CHECK(controller.shutdownDark(LaserCubeNetOperation::withTimeout(500ms)));
+}
+
+void ultra117UsesAcknowledgedEnableEvidence() {
+    LoopbackCube cube;
+    cube.setFirmware(1, 17);
+    cube.suppressReportedOutputFlag(true);
+    LaserCubeNetControllerInfo info(cube.status());
+    LaserCubeNetController controller(info, cube.network());
+    CHECK(controller.connectDark(info, LaserCubeNetOperation::withTimeout(500ms)));
+    installLitCallback(controller);
+    controller.startThread();
+
+    const auto enabled =
+        controller.enableOutput(LaserCubeNetOperation::withTimeout(500ms));
+    CHECK(enabled);
+    CHECK(enabled->evidence ==
+          LaserCubeNetRemoteEvidence::DeviceAcknowledgedEnabled);
+    CHECK(enabled->hasFreshStatus);
+    CHECK(!enabled->status.outputEnabled);
+
+    CHECK(controller.shutdownDark(LaserCubeNetOperation::withTimeout(500ms)));
 }
 
 void bufferCapabilityAndDroppedTrafficAreHandled() {
@@ -1506,6 +1591,8 @@ void failedShutdownNeverClaimsConfirmation() {
 
 int main() {
     connectEnableDisableShutdownIsOrdered();
+    enableWaitsForDeviceReportedStateToConverge();
+    ultra117UsesAcknowledgedEnableEvidence();
     bufferCapabilityAndDroppedTrafficAreHandled();
     rotatedSocketRejectsDelayedPriorStatus();
     cancellationPreservesPartialEvidence();
